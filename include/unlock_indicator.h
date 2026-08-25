@@ -3,6 +3,9 @@
 
 #include <xcb/xcb.h>
 
+#define I3LOCK_PAM_UI_TEXT_MAX 256
+#define I3LOCK_PAM_VISIBLE_INPUT_MAX 256
+
 typedef enum {
     STATE_STARTED = 0,           /* default state */
     STATE_KEY_PRESSED = 1,       /* key was pressed, show unlock indicator */

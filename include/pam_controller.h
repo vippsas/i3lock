@@ -5,10 +5,15 @@
 
 #include <stdint.h>
 
+#define PAM_EVENT_TEXT_MAX 256
+
 typedef enum {
     PAM_EVENT_AUTH_READY,
+    PAM_EVENT_AUTH_STATUS,
+    PAM_EVENT_AUTH_PROMPT,
     PAM_EVENT_AUTH_SUCCESS,
     PAM_EVENT_AUTH_FAILURE,
+    PAM_EVENT_AUTH_CANCELLED,
     PAM_EVENT_AUTH_FATAL,
 } pam_event_type_t;
 
@@ -16,6 +21,9 @@ typedef struct {
     pam_event_type_t type;
     uint64_t transaction_id;
     uint64_t prompt_id;
+    int echo_on;
+    int is_error;
+    char text[PAM_EVENT_TEXT_MAX];
 } pam_event_t;
 
 /*
@@ -34,6 +42,23 @@ void pam_controller_init(const char *username, const char *display);
  * the controller has not been initialized yet.
  */
 uint64_t pam_controller_start_auth(const char *password);
+
+/*
+ * Submit a response for the currently waiting prompt. Returns 1 when the
+ * answer was accepted by the controller, or 0 if the transaction/prompt no
+ * longer matches.
+ */
+int pam_controller_submit_answer(uint64_t transaction_id,
+                                 uint64_t prompt_id,
+                                 const char *answer);
+
+/*
+ * Request cancellation of an active transaction. If PAM is waiting inside
+ * the conversation callback, it is woken and the callback returns
+ * PAM_CONV_ERR. If PAM is doing backend work, the transaction is retired and
+ * the worker observes cancellation before the next prompt or terminal event.
+ */
+void pam_controller_cancel_auth(uint64_t transaction_id);
 
 /*
  * Returns the file descriptor that the main event loop should watch for

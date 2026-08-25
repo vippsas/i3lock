@@ -8,9 +8,9 @@
  * a libev-watched pipe.
  *
  * Credential copies owned by the controller live in a single mlock()ed
- * region. The foundation preserves legacy i3lock conversation semantics
- * during one PAM transaction and wipes the staged input when
- * pam_authenticate returns or the controller shuts down.
+ * region. The worker returns a credential to PAM only after ownership has
+ * transferred to the pam_response array, then immediately wipes the
+ * controller-owned copy.
  */
 
 #include <config.h>
@@ -76,11 +76,16 @@ static struct {
     bool auth_requested;
     bool auth_in_progress;
     bool shutdown_requested;
+    bool cancellation_requested;
+    bool waiting_for_answer;
+    bool answer_submitted;
 
     /* Transaction tracking. */
     uint64_t next_transaction_id;
     uint64_t next_prompt_id;
     uint64_t active_transaction_id;
+    uint64_t waiting_prompt_id;
+    int prompts_seen;
 
     /* PAM handle: exclusively owned by the worker. */
     pam_handle_t *pam_handle;
@@ -113,18 +118,37 @@ static void post_event_locked(pam_event_t event) {
     (void)write(ctrl.pipe_fds[1], &byte, 1);
 }
 
+static void free_replies(struct pam_response *reply, int count) {
+    if (reply == NULL) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        if (reply[i].resp != NULL) {
+            secure_wipe(reply[i].resp, strlen(reply[i].resp));
+            free(reply[i].resp);
+        }
+    }
+    free(reply);
+}
+
+static int copy_secure_value_to_response(char **response, const char *value) {
+    *response = strdup(value);
+    if (*response == NULL) {
+        return PAM_BUF_ERR;
+    }
+    return PAM_SUCCESS;
+}
+
+static void event_set_text(pam_event_t *event, const char *text) {
+    if (text == NULL) {
+        event->text[0] = '\0';
+        return;
+    }
+    snprintf(event->text, sizeof(event->text), "%s", text);
+}
+
 /* pam_conv callback, running in the worker thread */
 
-/*
- * Foundation-stage behaviour: every prompt in this callback batch
- * receives the deferred input that was staged by the main thread before
- * authentication started. INFO and ERROR messages receive a NULL
- * response.
- *
- * Note: uses (*resp)[i] (correct array indexing), not the resp[i]
- * pattern in the original conv_callback, which is a wild pointer
- * dereference when i is greater than zero.
- */
 static int worker_conv_callback(int num_msg,
                                 const struct pam_message **msg,
                                 struct pam_response **resp,
@@ -142,21 +166,88 @@ static int worker_conv_callback(int num_msg,
 
     pthread_mutex_lock(&ctrl.mutex);
     for (int i = 0; i < num_msg; i++) {
+        if (ctrl.shutdown_requested || ctrl.cancellation_requested) {
+            pthread_mutex_unlock(&ctrl.mutex);
+            free_replies(reply, num_msg);
+            return PAM_CONV_ERR;
+        }
+
         int style = msg[i]->msg_style;
         if (style == PAM_PROMPT_ECHO_OFF || style == PAM_PROMPT_ECHO_ON) {
-            reply[i].resp = strdup(ctrl.secure->deferred_input);
-            reply[i].resp_retcode = 0;
-            if (reply[i].resp == NULL) {
-                pthread_mutex_unlock(&ctrl.mutex);
-                for (int j = 0; j < i; j++) {
-                    if (reply[j].resp != NULL) {
-                        secure_wipe(reply[j].resp, strlen(reply[j].resp));
-                        free(reply[j].resp);
-                    }
+            ctrl.prompts_seen++;
+            bool use_deferred = ctrl.prompts_seen == 1 &&
+                                style == PAM_PROMPT_ECHO_OFF &&
+                                ctrl.secure->deferred_input[0] != '\0';
+
+            if (use_deferred) {
+                int result = copy_secure_value_to_response(&reply[i].resp,
+                                                           ctrl.secure->deferred_input);
+                secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+                if (result != PAM_SUCCESS) {
+                    pthread_mutex_unlock(&ctrl.mutex);
+                    free_replies(reply, num_msg);
+                    return result;
                 }
-                free(reply);
-                return PAM_BUF_ERR;
+                reply[i].resp_retcode = 0;
+                continue;
             }
+
+            secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+            uint64_t prompt_id = ctrl.next_prompt_id++;
+            ctrl.waiting_prompt_id = prompt_id;
+            ctrl.waiting_for_answer = true;
+            ctrl.answer_submitted = false;
+            pam_event_t event = {
+                .type = PAM_EVENT_AUTH_PROMPT,
+                .transaction_id = ctrl.active_transaction_id,
+                .prompt_id = prompt_id,
+                .echo_on = style == PAM_PROMPT_ECHO_ON,
+            };
+            event_set_text(&event, msg[i]->msg);
+            post_event_locked(event);
+
+            while (!ctrl.answer_submitted &&
+                   !ctrl.cancellation_requested &&
+                   !ctrl.shutdown_requested) {
+                pthread_cond_wait(&ctrl.cond, &ctrl.mutex);
+            }
+
+            if (ctrl.shutdown_requested || ctrl.cancellation_requested) {
+                ctrl.waiting_for_answer = false;
+                ctrl.answer_submitted = false;
+                ctrl.waiting_prompt_id = 0;
+                secure_wipe(ctrl.secure->pending_response, SECURE_BUFFER_SIZE);
+                pthread_mutex_unlock(&ctrl.mutex);
+                free_replies(reply, num_msg);
+                return PAM_CONV_ERR;
+            }
+
+            int result = copy_secure_value_to_response(&reply[i].resp,
+                                                       ctrl.secure->pending_response);
+            secure_wipe(ctrl.secure->pending_response, SECURE_BUFFER_SIZE);
+            ctrl.waiting_for_answer = false;
+            ctrl.answer_submitted = false;
+            ctrl.waiting_prompt_id = 0;
+            reply[i].resp_retcode = 0;
+            if (result != PAM_SUCCESS) {
+                pthread_mutex_unlock(&ctrl.mutex);
+                free_replies(reply, num_msg);
+                return result;
+            }
+        } else if (style == PAM_TEXT_INFO || style == PAM_ERROR_MSG) {
+            pam_event_t event = {
+                .type = PAM_EVENT_AUTH_STATUS,
+                .transaction_id = ctrl.active_transaction_id,
+                .prompt_id = 0,
+                .echo_on = 0,
+                .is_error = style == PAM_ERROR_MSG,
+            };
+            event_set_text(&event, msg[i]->msg);
+            post_event_locked(event);
+        } else {
+            pthread_mutex_unlock(&ctrl.mutex);
+            free_replies(reply, num_msg);
+            return PAM_CONV_ERR;
         }
         /* INFO and ERROR: reply[i] stays zeroed (resp=NULL, retcode=0). */
     }
@@ -220,6 +311,11 @@ static void *worker_main(void *arg) {
 
         ctrl.auth_requested = false;
         ctrl.auth_in_progress = true;
+        ctrl.cancellation_requested = false;
+        ctrl.waiting_for_answer = false;
+        ctrl.answer_submitted = false;
+        ctrl.waiting_prompt_id = 0;
+        ctrl.prompts_seen = 0;
         uint64_t txn = ctrl.active_transaction_id;
         pthread_mutex_unlock(&ctrl.mutex);
 
@@ -228,8 +324,20 @@ static void *worker_main(void *arg) {
 
         pthread_mutex_lock(&ctrl.mutex);
         secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+        secure_wipe(ctrl.secure->pending_response, SECURE_BUFFER_SIZE);
         ctrl.auth_in_progress = false;
-        if (ret == PAM_SUCCESS) {
+        ctrl.waiting_for_answer = false;
+        ctrl.answer_submitted = false;
+        ctrl.waiting_prompt_id = 0;
+        if (ctrl.cancellation_requested) {
+            ctrl.cancellation_requested = false;
+            post_event_locked((pam_event_t){
+                .type = PAM_EVENT_AUTH_CANCELLED,
+                .transaction_id = txn,
+                .prompt_id = 0,
+                .echo_on = 0,
+            });
+        } else if (ret == PAM_SUCCESS) {
             /* Refresh credentials (Kerberos tickets, etc.).
              * Do not downgrade a successful authentication if
              * credential refresh fails. */
@@ -238,12 +346,14 @@ static void *worker_main(void *arg) {
                 .type = PAM_EVENT_AUTH_SUCCESS,
                 .transaction_id = txn,
                 .prompt_id = 0,
+                .echo_on = 0,
             });
         } else {
             post_event_locked((pam_event_t){
                 .type = PAM_EVENT_AUTH_FAILURE,
                 .transaction_id = txn,
                 .prompt_id = 0,
+                .echo_on = 0,
             });
         }
     }
@@ -332,9 +442,8 @@ uint64_t pam_controller_start_auth(const char *password) {
 
     pthread_mutex_lock(&ctrl.mutex);
     if (ctrl.auth_requested || ctrl.auth_in_progress || ctrl.shutdown_requested) {
-        uint64_t txn = ctrl.active_transaction_id;
         pthread_mutex_unlock(&ctrl.mutex);
-        return txn;
+        return 0;
     }
 
     /* Stage the password in mlocked storage. */
@@ -348,11 +457,63 @@ uint64_t pam_controller_start_auth(const char *password) {
     uint64_t txn = ctrl.next_transaction_id++;
     ctrl.active_transaction_id = txn;
     ctrl.auth_requested = true;
+    ctrl.cancellation_requested = false;
+    ctrl.waiting_for_answer = false;
+    ctrl.answer_submitted = false;
+    ctrl.waiting_prompt_id = 0;
+    ctrl.prompts_seen = 0;
 
     pthread_cond_signal(&ctrl.cond);
     pthread_mutex_unlock(&ctrl.mutex);
 
     return txn;
+}
+
+int pam_controller_submit_answer(uint64_t transaction_id,
+                                 uint64_t prompt_id,
+                                 const char *answer) {
+    if (!ctrl.initialised) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&ctrl.mutex);
+    if (ctrl.shutdown_requested ||
+        ctrl.cancellation_requested ||
+        !ctrl.waiting_for_answer ||
+        ctrl.active_transaction_id != transaction_id ||
+        ctrl.waiting_prompt_id != prompt_id) {
+        pthread_mutex_unlock(&ctrl.mutex);
+        return 0;
+    }
+
+    size_t len = strlen(answer);
+    if (len >= SECURE_BUFFER_SIZE) {
+        len = SECURE_BUFFER_SIZE - 1;
+    }
+    memcpy(ctrl.secure->pending_response, answer, len);
+    ctrl.secure->pending_response[len] = '\0';
+    ctrl.answer_submitted = true;
+
+    pthread_cond_signal(&ctrl.cond);
+    pthread_mutex_unlock(&ctrl.mutex);
+    return 1;
+}
+
+void pam_controller_cancel_auth(uint64_t transaction_id) {
+    if (!ctrl.initialised || transaction_id == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&ctrl.mutex);
+    if (ctrl.active_transaction_id == transaction_id &&
+        (ctrl.auth_requested || ctrl.auth_in_progress)) {
+        ctrl.cancellation_requested = true;
+        ctrl.auth_requested = false;
+        secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+        secure_wipe(ctrl.secure->pending_response, SECURE_BUFFER_SIZE);
+        pthread_cond_signal(&ctrl.cond);
+    }
+    pthread_mutex_unlock(&ctrl.mutex);
 }
 
 int pam_controller_get_fd(void) {

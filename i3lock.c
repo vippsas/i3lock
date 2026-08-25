@@ -67,6 +67,8 @@ static xcb_cursor_t cursor;
 #ifndef __OpenBSD__
 static bool controller_started = false;
 static uint64_t active_pam_transaction_id = 0;
+static uint64_t active_pam_prompt_id = 0;
+static bool pam_waiting_for_prompt = false;
 static struct ev_io *pam_watcher = NULL;
 static char *saved_username = NULL;
 #endif
@@ -77,6 +79,11 @@ static bool beep = false;
 bool debug_mode = false;
 bool unlock_indicator = true;
 char *modifier_string = NULL;
+char pam_status_text[I3LOCK_PAM_UI_TEXT_MAX];
+char pam_prompt_text[I3LOCK_PAM_UI_TEXT_MAX];
+char pam_visible_input[I3LOCK_PAM_VISIBLE_INPUT_MAX];
+bool pam_status_is_error = false;
+bool pam_prompt_echo_on = false;
 static bool dont_fork = false;
 struct ev_loop *main_loop;
 static struct ev_timer *clear_auth_wrong_timeout;
@@ -273,6 +280,7 @@ static void clear_input(void) {
     input_position = 0;
     clear_password_memory();
     password[input_position] = '\0';
+    pam_visible_input[0] = '\0';
 }
 
 static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
@@ -304,10 +312,55 @@ static void auth_failed(void) {
     }
 }
 
+static void clear_pam_display_text(void) {
+    pam_status_text[0] = '\0';
+    pam_prompt_text[0] = '\0';
+    pam_visible_input[0] = '\0';
+    pam_status_is_error = false;
+    pam_prompt_echo_on = false;
+}
+
+static void update_pam_visible_input(void) {
+    if (pam_prompt_echo_on) {
+        size_t len = strlen(password);
+        if (len >= sizeof(pam_visible_input)) {
+            len = sizeof(pam_visible_input) - 1;
+        }
+        memcpy(pam_visible_input, password, len);
+        pam_visible_input[len] = '\0';
+    } else {
+        pam_visible_input[0] = '\0';
+    }
+}
+
 #ifndef __OpenBSD__
 static void handle_pam_event(const pam_event_t *event) {
     switch (event->type) {
         case PAM_EVENT_AUTH_READY:
+            return;
+
+        case PAM_EVENT_AUTH_STATUS:
+            if (event->transaction_id != active_pam_transaction_id) {
+                return;
+            }
+            snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
+            pam_status_is_error = event->is_error;
+            redraw_screen();
+            return;
+
+        case PAM_EVENT_AUTH_PROMPT:
+            if (event->transaction_id != active_pam_transaction_id) {
+                return;
+            }
+            active_pam_prompt_id = event->prompt_id;
+            pam_waiting_for_prompt = true;
+            snprintf(pam_prompt_text, sizeof(pam_prompt_text), "%s", event->text);
+            pam_prompt_echo_on = event->echo_on;
+            pam_visible_input[0] = '\0';
+            auth_state = STATE_AUTH_IDLE;
+            unlock_state = STATE_KEY_PRESSED;
+            clear_input();
+            redraw_screen();
             return;
 
         case PAM_EVENT_AUTH_SUCCESS:
@@ -315,6 +368,10 @@ static void handle_pam_event(const pam_event_t *event) {
                 return;
             }
             DEBUG("successfully authenticated\n");
+            active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            clear_pam_display_text();
             clear_password_memory();
             ev_break(EV_DEFAULT, EVBREAK_ALL);
             return;
@@ -324,11 +381,29 @@ static void handle_pam_event(const pam_event_t *event) {
                 return;
             }
             active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            clear_pam_display_text();
             auth_failed();
+            return;
+
+        case PAM_EVENT_AUTH_CANCELLED:
+            if (event->transaction_id != active_pam_transaction_id) {
+                return;
+            }
+            active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            clear_pam_display_text();
+            auth_state = STATE_AUTH_IDLE;
+            redraw_screen();
             return;
 
         case PAM_EVENT_AUTH_FATAL:
             active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            clear_pam_display_text();
             auth_state = STATE_I3LOCK_LOCK_FAILED;
             clear_input();
             redraw_screen();
@@ -372,6 +447,23 @@ static void input_done(void) {
 
     auth_failed();
 #else
+    if (pam_waiting_for_prompt) {
+        uint64_t transaction_id = active_pam_transaction_id;
+        uint64_t prompt_id = active_pam_prompt_id;
+        pam_waiting_for_prompt = false;
+        active_pam_prompt_id = 0;
+        pam_prompt_text[0] = '\0';
+        pam_visible_input[0] = '\0';
+        pam_prompt_echo_on = false;
+        auth_state = STATE_AUTH_VERIFY;
+        if (!pam_controller_submit_answer(transaction_id, prompt_id, password)) {
+            auth_state = STATE_AUTH_IDLE;
+        }
+        clear_password_memory();
+        redraw_screen();
+        return;
+    }
+
     if (!controller_started) {
         auth_state = STATE_I3LOCK_LOCK_FAILED;
         redraw_screen();
@@ -380,10 +472,12 @@ static void input_done(void) {
 
     active_pam_transaction_id = pam_controller_start_auth(password);
     if (active_pam_transaction_id == 0) {
-        auth_state = STATE_I3LOCK_LOCK_FAILED;
+        auth_state = STATE_AUTH_IDLE;
+        clear_password_memory();
         redraw_screen();
         return;
     }
+    clear_pam_display_text();
     clear_password_memory();
 #endif
 }
@@ -485,6 +579,16 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             if ((ksym == XKB_KEY_u && ctrl) ||
                 ksym == XKB_KEY_Escape) {
                 DEBUG("C-u pressed\n");
+#ifndef __OpenBSD__
+                if (ksym == XKB_KEY_Escape && active_pam_transaction_id != 0) {
+                    pam_controller_cancel_auth(active_pam_transaction_id);
+                    active_pam_transaction_id = 0;
+                    active_pam_prompt_id = 0;
+                    pam_waiting_for_prompt = false;
+                    clear_pam_display_text();
+                    auth_state = STATE_AUTH_IDLE;
+                }
+#endif
                 clear_input();
                 /* Also hide the unlock indicator */
                 if (unlock_indicator) {
@@ -518,6 +622,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             /* decrement input_position to point to the previous glyph */
             u8_dec(password, &input_position);
             password[input_position] = '\0';
+            update_pam_visible_input();
 
             /* Hide the unlock indicator after a bit if the password buffer is
              * empty. */
@@ -550,6 +655,8 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     /* store it in the password array as UTF-8 */
     memcpy(password + input_position, buffer, n - 1);
     input_position += n - 1;
+    password[input_position] = '\0';
+    update_pam_visible_input();
     DEBUG("key accepted, input_position = %d\n", input_position);
 
     if (unlock_indicator) {

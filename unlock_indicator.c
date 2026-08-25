@@ -49,6 +49,11 @@ extern bool unlock_indicator;
 
 /* List of pressed modifiers, or NULL if none are pressed. */
 extern char *modifier_string;
+extern char pam_status_text[I3LOCK_PAM_UI_TEXT_MAX];
+extern char pam_prompt_text[I3LOCK_PAM_UI_TEXT_MAX];
+extern char pam_visible_input[I3LOCK_PAM_VISIBLE_INPUT_MAX];
+extern bool pam_status_is_error;
+extern bool pam_prompt_echo_on;
 /* Name of the current keyboard layout or NULL if not initialized. */
 char *layout_string = NULL;
 
@@ -116,6 +121,19 @@ static void display_button_text(
     } else {
         cairo_set_source_rgb(ctx, 1., 1., 1.);
     }
+    cairo_show_text(ctx, text);
+    cairo_close_path(ctx);
+}
+
+static void display_centered_text(cairo_t *ctx, const char *text, double y_offset) {
+    cairo_text_extents_t extents;
+    double x, y;
+
+    cairo_text_extents(ctx, text, &extents);
+    x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
+    y = BUTTON_CENTER - ((extents.height / 2) + extents.y_bearing) + y_offset;
+
+    cairo_move_to(ctx, x, y);
     cairo_show_text(ctx, text);
     cairo_close_path(ctx);
 }
@@ -292,6 +310,7 @@ void draw_image(xcb_pixmap_t bg_pixmap, uint32_t *resolution) {
 
         /* Display a (centered) text of the current PAM state. */
         char *text = NULL;
+        bool prompt_text_is_main = false;
         /* We don't want to show more than a 3-digit number. */
         char buf[4];
 
@@ -325,11 +344,41 @@ void draw_image(xcb_pixmap_t bg_pixmap, uint32_t *resolution) {
                     cairo_set_source_rgb(ctx, 1, 0, 0);
                     cairo_set_font_size(ctx, 32.0);
                 }
+                if (pam_prompt_echo_on && pam_visible_input[0] != '\0') {
+                    text = pam_visible_input;
+                    cairo_set_font_size(ctx, 16.0);
+                } else if (pam_prompt_text[0] != '\0' && !pam_prompt_echo_on) {
+                    text = pam_prompt_text;
+                    prompt_text_is_main = true;
+                    cairo_set_font_size(ctx, 16.0);
+                }
                 break;
         }
 
         if (text) {
             display_button_text(ctx, text, 0., use_dark_text);
+        }
+
+        if (pam_prompt_text[0] != '\0' && !prompt_text_is_main) {
+            cairo_set_font_size(ctx, 12.0);
+            if (use_dark_text) {
+                cairo_set_source_rgb(ctx, 0., 0., 0.);
+            } else {
+                cairo_set_source_rgb(ctx, 1., 1., 1.);
+            }
+            display_centered_text(ctx, pam_prompt_text, -28.);
+        }
+
+        if (pam_status_text[0] != '\0') {
+            cairo_set_font_size(ctx, 12.0);
+            if (pam_status_is_error) {
+                cairo_set_source_rgb(ctx, 1., 0., 0.);
+            } else if (use_dark_text) {
+                cairo_set_source_rgb(ctx, 0., 0., 0.);
+            } else {
+                cairo_set_source_rgb(ctx, 1., 1., 1.);
+            }
+            display_centered_text(ctx, pam_status_text, 28.);
         }
 
         if (modifier_string != NULL) {
