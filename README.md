@@ -48,6 +48,14 @@ Running i3lock
 To test i3lock, you can directly run the `i3lock` command. To get out of it,
 enter your password and press enter.
 
+i3lock authenticates through the system PAM service named `i3lock` on Linux.
+It supports standard sequential PAM conversations: informational messages,
+error messages, hidden prompts, and visible prompts are handled in the order
+provided by PAM. Hidden prompts keep the normal masked lock-screen behaviour;
+visible prompts echo the entered text as requested by PAM. Pressing Escape
+cancels the active PAM conversation from i3lock's side and returns to the
+locked input state. i3lock never logs entered credentials.
+
 For a more permanent setup, we strongly recommend using `xss-lock` so that the
 screen is locked *before* your laptop suspends:
 

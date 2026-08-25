@@ -79,6 +79,7 @@ static struct {
     bool cancellation_requested;
     bool waiting_for_answer;
     bool answer_submitted;
+    bool fatal_error;
 
     /* Transaction tracking. */
     uint64_t next_transaction_id;
@@ -89,6 +90,7 @@ static struct {
 
     /* PAM handle: exclusively owned by the worker. */
     pam_handle_t *pam_handle;
+    struct pam_conv pam_conv;
 
     /* Initialisation parameters (copied). */
     char *username;
@@ -145,6 +147,40 @@ static void event_set_text(pam_event_t *event, const char *text) {
         return;
     }
     snprintf(event->text, sizeof(event->text), "%s", text);
+}
+
+static int worker_conv_callback(int num_msg,
+                                const struct pam_message **msg,
+                                struct pam_response **resp,
+                                void *appdata_ptr);
+
+static int start_pam_handle(void) {
+    ctrl.pam_conv = (struct pam_conv){worker_conv_callback, NULL};
+    int ret = pam_start("i3lock", ctrl.username, &ctrl.pam_conv, &ctrl.pam_handle);
+    if (ret != PAM_SUCCESS) {
+        fprintf(stderr, "[i3lock] PAM worker: pam_start failed (%d)\n", ret);
+        ctrl.pam_handle = NULL;
+        return ret;
+    }
+
+    if (ctrl.display != NULL) {
+        ret = pam_set_item(ctrl.pam_handle, PAM_TTY, ctrl.display);
+        if (ret != PAM_SUCCESS) {
+            fprintf(stderr, "[i3lock] PAM worker: pam_set_item(PAM_TTY) failed (%d)\n", ret);
+            pam_end(ctrl.pam_handle, ret);
+            ctrl.pam_handle = NULL;
+            return ret;
+        }
+    }
+
+    return PAM_SUCCESS;
+}
+
+static void end_pam_handle(int status) {
+    if (ctrl.pam_handle != NULL) {
+        pam_end(ctrl.pam_handle, status);
+        ctrl.pam_handle = NULL;
+    }
 }
 
 /* pam_conv callback, running in the worker thread */
@@ -263,10 +299,8 @@ static void *worker_main(void *arg) {
     (void)arg;
 
     /* Initialise the PAM handle. The worker owns it exclusively. */
-    struct pam_conv conv = {worker_conv_callback, NULL};
-    int ret = pam_start("i3lock", ctrl.username, &conv, &ctrl.pam_handle);
+    int ret = start_pam_handle();
     if (ret != PAM_SUCCESS) {
-        fprintf(stderr, "[i3lock] PAM worker: pam_start failed (%d)\n", ret);
         pthread_mutex_lock(&ctrl.mutex);
         post_event_locked((pam_event_t){
             .type = PAM_EVENT_AUTH_FATAL,
@@ -275,23 +309,6 @@ static void *worker_main(void *arg) {
         });
         pthread_mutex_unlock(&ctrl.mutex);
         return NULL;
-    }
-
-    if (ctrl.display != NULL) {
-        ret = pam_set_item(ctrl.pam_handle, PAM_TTY, ctrl.display);
-        if (ret != PAM_SUCCESS) {
-            fprintf(stderr, "[i3lock] PAM worker: pam_set_item(PAM_TTY) failed (%d)\n", ret);
-            pthread_mutex_lock(&ctrl.mutex);
-            post_event_locked((pam_event_t){
-                .type = PAM_EVENT_AUTH_FATAL,
-                .transaction_id = 0,
-                .prompt_id = 0,
-            });
-            pthread_mutex_unlock(&ctrl.mutex);
-            pam_end(ctrl.pam_handle, ret);
-            ctrl.pam_handle = NULL;
-            return NULL;
-        }
     }
 
     pthread_mutex_lock(&ctrl.mutex);
@@ -348,6 +365,54 @@ static void *worker_main(void *arg) {
                 .prompt_id = 0,
                 .echo_on = 0,
             });
+        } else if (ret == PAM_ABORT) {
+            pam_event_t event = {
+                .type = PAM_EVENT_AUTH_FATAL,
+                .transaction_id = txn,
+                .prompt_id = 0,
+                .echo_on = 0,
+                .is_error = 1,
+            };
+            event_set_text(&event, "Authentication service failed");
+            ctrl.fatal_error = true;
+            post_event_locked(event);
+            pthread_mutex_unlock(&ctrl.mutex);
+            end_pam_handle(ret);
+            pthread_mutex_lock(&ctrl.mutex);
+        } else if (ret == PAM_SYSTEM_ERR || ret == PAM_SERVICE_ERR) {
+            pam_event_t event = {
+                .type = PAM_EVENT_AUTH_FAILURE,
+                .transaction_id = txn,
+                .prompt_id = 0,
+                .echo_on = 0,
+                .is_error = 1,
+            };
+            event_set_text(&event, "Authentication service error");
+            post_event_locked(event);
+
+            pthread_mutex_unlock(&ctrl.mutex);
+            end_pam_handle(ret);
+            ret = start_pam_handle();
+            pthread_mutex_lock(&ctrl.mutex);
+            if (ret == PAM_SUCCESS) {
+                post_event_locked((pam_event_t){
+                    .type = PAM_EVENT_AUTH_READY,
+                    .transaction_id = 0,
+                    .prompt_id = 0,
+                    .echo_on = 0,
+                });
+            } else {
+                pam_event_t fatal = {
+                    .type = PAM_EVENT_AUTH_FATAL,
+                    .transaction_id = 0,
+                    .prompt_id = 0,
+                    .echo_on = 0,
+                    .is_error = 1,
+                };
+                event_set_text(&fatal, "Authentication service failed");
+                ctrl.fatal_error = true;
+                post_event_locked(fatal);
+            }
         } else {
             post_event_locked((pam_event_t){
                 .type = PAM_EVENT_AUTH_FAILURE,
@@ -359,10 +424,7 @@ static void *worker_main(void *arg) {
     }
     pthread_mutex_unlock(&ctrl.mutex);
 
-    if (ctrl.pam_handle != NULL) {
-        pam_end(ctrl.pam_handle, PAM_SUCCESS);
-        ctrl.pam_handle = NULL;
-    }
+    end_pam_handle(PAM_SUCCESS);
     return NULL;
 }
 
@@ -441,7 +503,10 @@ uint64_t pam_controller_start_auth(const char *password) {
     }
 
     pthread_mutex_lock(&ctrl.mutex);
-    if (ctrl.auth_requested || ctrl.auth_in_progress || ctrl.shutdown_requested) {
+    if (ctrl.auth_requested ||
+        ctrl.auth_in_progress ||
+        ctrl.shutdown_requested ||
+        ctrl.fatal_error) {
         pthread_mutex_unlock(&ctrl.mutex);
         return 0;
     }

@@ -59,6 +59,7 @@
 
 typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
 static void input_done(void);
+static void clear_pam_display_text(void);
 
 char color[7] = "a3a3a3";
 uint32_t last_resolution[2];
@@ -69,6 +70,7 @@ static bool controller_started = false;
 static uint64_t active_pam_transaction_id = 0;
 static uint64_t active_pam_prompt_id = 0;
 static bool pam_waiting_for_prompt = false;
+static bool pam_auth_fatal = false;
 static struct ev_io *pam_watcher = NULL;
 static char *saved_username = NULL;
 #endif
@@ -84,6 +86,7 @@ char pam_prompt_text[I3LOCK_PAM_UI_TEXT_MAX];
 char pam_visible_input[I3LOCK_PAM_VISIBLE_INPUT_MAX];
 bool pam_status_is_error = false;
 bool pam_prompt_echo_on = false;
+static bool pam_status_expires_with_auth_wrong = false;
 static bool dont_fork = false;
 struct ev_loop *main_loop;
 static struct ev_timer *clear_auth_wrong_timeout;
@@ -253,6 +256,9 @@ static void finish_input(void) {
 static void clear_auth_wrong(EV_P_ ev_timer *w, int revents) {
     DEBUG("clearing auth wrong\n");
     auth_state = STATE_AUTH_IDLE;
+    if (pam_status_expires_with_auth_wrong) {
+        clear_pam_display_text();
+    }
     redraw_screen();
 
     /* Clear modifier string. */
@@ -318,6 +324,7 @@ static void clear_pam_display_text(void) {
     pam_visible_input[0] = '\0';
     pam_status_is_error = false;
     pam_prompt_echo_on = false;
+    pam_status_expires_with_auth_wrong = false;
 }
 
 static void update_pam_visible_input(void) {
@@ -345,6 +352,7 @@ static void handle_pam_event(const pam_event_t *event) {
             }
             snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
             pam_status_is_error = event->is_error;
+            pam_status_expires_with_auth_wrong = false;
             redraw_screen();
             return;
 
@@ -383,7 +391,14 @@ static void handle_pam_event(const pam_event_t *event) {
             active_pam_transaction_id = 0;
             active_pam_prompt_id = 0;
             pam_waiting_for_prompt = false;
-            clear_pam_display_text();
+            if (event->text[0] != '\0') {
+                clear_pam_display_text();
+                snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
+                pam_status_is_error = event->is_error;
+                pam_status_expires_with_auth_wrong = true;
+            } else {
+                clear_pam_display_text();
+            }
             auth_failed();
             return;
 
@@ -403,7 +418,15 @@ static void handle_pam_event(const pam_event_t *event) {
             active_pam_transaction_id = 0;
             active_pam_prompt_id = 0;
             pam_waiting_for_prompt = false;
-            clear_pam_display_text();
+            pam_auth_fatal = true;
+            if (event->text[0] != '\0') {
+                clear_pam_display_text();
+                snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
+                pam_status_is_error = event->is_error;
+                pam_status_expires_with_auth_wrong = false;
+            } else {
+                clear_pam_display_text();
+            }
             auth_state = STATE_I3LOCK_LOCK_FAILED;
             clear_input();
             redraw_screen();
@@ -420,6 +443,15 @@ static void pam_event_cb(EV_P_ ev_io *w, int revents) {
 
 static void input_done(void) {
     STOP_TIMER(clear_auth_wrong_timeout);
+
+#ifndef __OpenBSD__
+    if (pam_auth_fatal) {
+        auth_state = STATE_I3LOCK_LOCK_FAILED;
+        clear_input();
+        redraw_screen();
+        return;
+    }
+#endif
 
     /* Do not start a second authentication while one is in progress. */
     if (auth_state == STATE_AUTH_VERIFY) {
