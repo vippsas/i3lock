@@ -1027,6 +1027,12 @@ static void xcb_prepare_cb(EV_P_ ev_prepare *w, int revents) {
  *
  */
 static void maybe_close_sleep_lock_fd(void) {
+    static bool sleep_lock_fd_closed = false;
+    if (sleep_lock_fd_closed) {
+        return;
+    }
+    sleep_lock_fd_closed = true;
+
     const char *sleep_lock_fd = getenv("XSS_SLEEP_LOCK_FD");
     char *endptr;
     if (sleep_lock_fd && *sleep_lock_fd != 0) {
@@ -1034,6 +1040,15 @@ static void maybe_close_sleep_lock_fd(void) {
         if (*endptr == 0) {
             close(fd);
         }
+        unsetenv("XSS_SLEEP_LOCK_FD");
+    }
+}
+
+static void stay_locked_after_lock_failure(void) {
+    auth_state = STATE_I3LOCK_LOCK_FAILED;
+    redraw_screen();
+    while (true) {
+        pause();
     }
 }
 
@@ -1060,6 +1075,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
             continue;
         }
 
+        bool synthetic_event = (event->response_type & 0x80) != 0;
         /* Strip off the highest bit (set if the event is generated) */
         int type = (event->response_type & 0x7F);
 
@@ -1073,18 +1089,24 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 break;
 
             case XCB_MAP_NOTIFY:
+                if (synthetic_event) {
+                    break;
+                }
                 maybe_close_sleep_lock_fd();
                 if (!dont_fork) {
                     /* After the first MapNotify, we never fork again. We don’t
                      * expect to get another MapNotify, but better be sure… */
                     dont_fork = true;
 
-                    /* In the parent process, we exit */
-                    if (fork() != 0) {
+                    pid_t fork_result = fork();
+                    if (fork_result == -1) {
+                        fprintf(stderr, "[i3lock] could not daemonize after locking; continuing in foreground\n");
+                    } else if (fork_result != 0) {
+                        /* In the parent process, we exit */
                         exit(0);
+                    } else {
+                        ev_loop_fork(EV_DEFAULT);
                     }
-
-                    ev_loop_fork(EV_DEFAULT);
                 }
 #ifndef __OpenBSD__
                 if (!controller_started) {
@@ -1485,6 +1507,12 @@ int main(int argc, char *argv[]) {
     struct ev_io *xcb_watcher = calloc(1, sizeof(struct ev_io));
     struct ev_check *xcb_check = calloc(1, sizeof(struct ev_check));
     struct ev_prepare *xcb_prepare = calloc(1, sizeof(struct ev_prepare));
+    if (xcb_watcher == NULL || xcb_check == NULL || xcb_prepare == NULL) {
+        free(xcb_watcher);
+        free(xcb_check);
+        free(xcb_prepare);
+        stay_locked_after_lock_failure();
+    }
 
     ev_io_init(xcb_watcher, xcb_got_event, xcb_get_file_descriptor(conn), EV_READ);
     ev_io_start(main_loop, xcb_watcher);

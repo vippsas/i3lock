@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <security/pam_appl.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -118,7 +119,10 @@ static void post_event_locked(pam_event_t event) {
         ctrl.events[MAX_EVENTS - 1] = event;
     }
     char byte = 0;
-    (void)write(ctrl.pipe_fds[1], &byte, 1);
+    ssize_t written;
+    do {
+        written = write(ctrl.pipe_fds[1], &byte, 1);
+    } while (written == -1 && errno == EINTR);
 }
 
 static void free_replies(struct pam_response *reply, int count) {
@@ -215,8 +219,18 @@ static int worker_conv_callback(int num_msg,
                                 void *appdata_ptr) {
     (void)appdata_ptr;
 
-    if (num_msg <= 0) {
+    if (num_msg <= 0 ||
+        num_msg > PAM_MAX_NUM_MSG ||
+        msg == NULL ||
+        resp == NULL) {
         return PAM_CONV_ERR;
+    }
+    *resp = NULL;
+
+    for (int i = 0; i < num_msg; i++) {
+        if (msg[i] == NULL) {
+            return PAM_CONV_ERR;
+        }
     }
 
     struct pam_response *reply = calloc((size_t)num_msg, sizeof(*reply));
@@ -380,6 +394,32 @@ static void *worker_main(void *arg) {
                 .prompt_id = 0,
                 .echo_on = 0,
             });
+            ctrl.pam_handle = NULL;
+            pthread_mutex_unlock(&ctrl.mutex);
+            end_pam_handle(handle, ret);
+            handle = NULL;
+            ret = start_pam_handle(&handle);
+            pthread_mutex_lock(&ctrl.mutex);
+            if (ret == PAM_SUCCESS) {
+                ctrl.pam_handle = handle;
+                post_event_locked((pam_event_t){
+                    .type = PAM_EVENT_AUTH_READY,
+                    .transaction_id = 0,
+                    .prompt_id = 0,
+                    .echo_on = 0,
+                });
+            } else {
+                pam_event_t fatal = {
+                    .type = PAM_EVENT_AUTH_FATAL,
+                    .transaction_id = 0,
+                    .prompt_id = 0,
+                    .echo_on = 0,
+                    .is_error = 1,
+                };
+                event_set_text(&fatal, "Authentication service failed");
+                ctrl.fatal_error = true;
+                post_event_locked(fatal);
+            }
         } else if (ret == PAM_SUCCESS) {
             /* Refresh credentials (Kerberos tickets, etc.).
              * Do not downgrade a successful authentication if
@@ -391,7 +431,7 @@ static void *worker_main(void *arg) {
                 .prompt_id = 0,
                 .echo_on = 0,
             });
-        } else if (ret == PAM_ABORT) {
+        } else if (ret == PAM_ABORT || ret == PAM_MAXTRIES) {
             pam_event_t event = {
                 .type = PAM_EVENT_AUTH_FATAL,
                 .transaction_id = txn,
@@ -538,6 +578,12 @@ int pam_controller_init(const char *username, const char *display) {
     ctrl.next_transaction_id = 1;
     ctrl.next_prompt_id = 1;
     ctrl.pam_conv = (struct pam_conv){worker_conv_callback, NULL};
+
+    struct sigaction action = {
+        .sa_handler = SIG_IGN,
+    };
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGPIPE, &action, NULL);
 
     /* Start the worker thread. */
     if (pthread_create(&ctrl.worker, NULL, worker_main, NULL) != 0) {
