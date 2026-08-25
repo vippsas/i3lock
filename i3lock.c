@@ -41,6 +41,9 @@
 #include <xcb/randr.h>
 
 #include "i3lock.h"
+#ifndef __OpenBSD__
+#include "pam_controller.h"
+#endif
 #include "xcb.h"
 #include "cursors.h"
 #include "unlock_indicator.h"
@@ -62,8 +65,10 @@ uint32_t last_resolution[2];
 xcb_window_t win;
 static xcb_cursor_t cursor;
 #ifndef __OpenBSD__
-static pam_handle_t *pam_handle;
-static bool pam_cleanup;
+static bool controller_started = false;
+static uint64_t active_pam_transaction_id = 0;
+static struct ev_io *pam_watcher = NULL;
+static char *saved_username = NULL;
 #endif
 int input_position = 0;
 /* Holds the password you enter (in UTF-8). */
@@ -275,8 +280,77 @@ static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
     STOP_TIMER(discard_passwd_timeout);
 }
 
+static void auth_failed(void) {
+    if (debug_mode) {
+        fprintf(stderr, "Authentication failure\n");
+    }
+
+    auth_state = STATE_AUTH_WRONG;
+    if (failed_attempts < 999) {
+        failed_attempts += 1;
+    }
+    clear_input();
+    if (unlock_indicator) {
+        redraw_screen();
+    }
+
+    ev_now_update(main_loop);
+    START_TIMER(clear_auth_wrong_timeout, TSTAMP_N_SECS(2), clear_auth_wrong);
+    STOP_TIMER(clear_indicator_timeout);
+
+    if (beep) {
+        xcb_bell(conn, 100);
+        xcb_flush(conn);
+    }
+}
+
+#ifndef __OpenBSD__
+static void handle_pam_event(const pam_event_t *event) {
+    switch (event->type) {
+        case PAM_EVENT_AUTH_READY:
+            return;
+
+        case PAM_EVENT_AUTH_SUCCESS:
+            if (event->transaction_id != active_pam_transaction_id) {
+                return;
+            }
+            DEBUG("successfully authenticated\n");
+            clear_password_memory();
+            ev_break(EV_DEFAULT, EVBREAK_ALL);
+            return;
+
+        case PAM_EVENT_AUTH_FAILURE:
+            if (event->transaction_id != active_pam_transaction_id) {
+                return;
+            }
+            active_pam_transaction_id = 0;
+            auth_failed();
+            return;
+
+        case PAM_EVENT_AUTH_FATAL:
+            active_pam_transaction_id = 0;
+            auth_state = STATE_I3LOCK_LOCK_FAILED;
+            clear_input();
+            redraw_screen();
+            return;
+    }
+}
+
+static void pam_event_cb(EV_P_ ev_io *w, int revents) {
+    (void)w;
+    (void)revents;
+    pam_controller_drain_events(handle_pam_event);
+}
+#endif
+
 static void input_done(void) {
     STOP_TIMER(clear_auth_wrong_timeout);
+
+    /* Do not start a second authentication while one is in progress. */
+    if (auth_state == STATE_AUTH_VERIFY) {
+        return;
+    }
+
     auth_state = STATE_AUTH_VERIFY;
     unlock_state = STATE_STARTED;
     redraw_screen();
@@ -295,52 +369,23 @@ static void input_done(void) {
         ev_break(EV_DEFAULT, EVBREAK_ALL);
         return;
     }
+
+    auth_failed();
 #else
-    if (pam_authenticate(pam_handle, 0) == PAM_SUCCESS) {
-        DEBUG("successfully authenticated\n");
-        clear_password_memory();
-
-        /* PAM credentials should be refreshed, this will for example update any kerberos tickets.
-         * Related to credentials pam_end() needs to be called to cleanup any temporary
-         * credentials like kerberos /tmp/krb5cc_pam_* files which may of been left behind if the
-         * refresh of the credentials failed. */
-        pam_setcred(pam_handle, PAM_REFRESH_CRED);
-        pam_cleanup = true;
-
-        ev_break(EV_DEFAULT, EVBREAK_ALL);
+    if (!controller_started) {
+        auth_state = STATE_I3LOCK_LOCK_FAILED;
+        redraw_screen();
         return;
     }
-#endif
 
-    if (debug_mode) {
-        fprintf(stderr, "Authentication failure\n");
-    }
-
-    auth_state = STATE_AUTH_WRONG;
-    /* The unlock indicator displays the number of failed attempts,
-     * but caps the attempts to 999, so only increment up to 999. */
-    if (failed_attempts < 999) {
-        failed_attempts += 1;
-    }
-    clear_input();
-    if (unlock_indicator) {
+    active_pam_transaction_id = pam_controller_start_auth(password);
+    if (active_pam_transaction_id == 0) {
+        auth_state = STATE_I3LOCK_LOCK_FAILED;
         redraw_screen();
+        return;
     }
-
-    /* Clear this state after 2 seconds (unless the user enters another
-     * password during that time). */
-    ev_now_update(main_loop);
-    START_TIMER(clear_auth_wrong_timeout, TSTAMP_N_SECS(2), clear_auth_wrong);
-
-    /* Cancel the clear_indicator_timeout, it would hide the unlock indicator
-     * too early. */
-    STOP_TIMER(clear_indicator_timeout);
-
-    /* beep on authentication failure, if enabled */
-    if (beep) {
-        xcb_bell(conn, 100);
-        xcb_flush(conn);
-    }
+    clear_password_memory();
+#endif
 }
 
 static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
@@ -505,7 +550,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     /* store it in the password array as UTF-8 */
     memcpy(password + input_position, buffer, n - 1);
     input_position += n - 1;
-    DEBUG("current password = %.*s\n", input_position, password);
+    DEBUG("key accepted, input_position = %d\n", input_position);
 
     if (unlock_indicator) {
         unlock_state = STATE_KEY_ACTIVE;
@@ -808,40 +853,7 @@ static bool verify_png_image(const char *image_path) {
     return true;
 }
 
-#ifndef __OpenBSD__
-/*
- * Callback function for PAM. We only react on password request callbacks.
- *
- */
-static int conv_callback(int num_msg, const struct pam_message **msg,
-                         struct pam_response **resp, void *appdata_ptr) {
-    if (num_msg == 0) {
-        return 1;
-    }
-
-    /* PAM expects an array of responses, one for each message */
-    if ((*resp = calloc(num_msg, sizeof(struct pam_response))) == NULL) {
-        perror("calloc");
-        return 1;
-    }
-
-    for (int c = 0; c < num_msg; c++) {
-        if (msg[c]->msg_style != PAM_PROMPT_ECHO_OFF &&
-            msg[c]->msg_style != PAM_PROMPT_ECHO_ON) {
-            continue;
-        }
-
-        /* return code is currently not used but should be set to zero */
-        resp[c]->resp_retcode = 0;
-        if ((resp[c]->resp = strdup(password)) == NULL) {
-            perror("strdup");
-            return 1;
-        }
-    }
-
-    return 0;
-}
-#endif
+/* conv_callback has moved to pam_controller.c (worker_conv_callback). */
 
 /*
  * This callback is only a dummy, see xcb_prepare_cb and xcb_check_cb.
@@ -925,6 +937,19 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
 
                     ev_loop_fork(EV_DEFAULT);
                 }
+#ifndef __OpenBSD__
+                if (!controller_started) {
+                    controller_started = true;
+                    pam_controller_init(saved_username, getenv("DISPLAY"));
+                    pam_watcher = calloc(1, sizeof(struct ev_io));
+                    if (pam_watcher == NULL) {
+                        errx(EXIT_FAILURE, "calloc pam_watcher");
+                    }
+                    ev_io_init(pam_watcher, pam_event_cb,
+                               pam_controller_get_fd(), EV_READ);
+                    ev_io_start(main_loop, pam_watcher);
+                }
+#endif
                 break;
 
             case XCB_CONFIGURE_NOTIFY:
@@ -1010,10 +1035,6 @@ int main(int argc, char *argv[]) {
     char *username;
     char *image_path = NULL;
     char *image_raw_format = NULL;
-#ifndef __OpenBSD__
-    int ret;
-    struct pam_conv conv = {conv_callback, NULL};
-#endif
     int curs_choice = CURS_NONE;
     int o;
     int longoptind = 0;
@@ -1118,6 +1139,9 @@ int main(int argc, char *argv[]) {
     if ((username = pw->pw_name) == NULL) {
         errx(EXIT_FAILURE, "pw->pw_name is NULL.");
     }
+#ifndef __OpenBSD__
+    saved_username = username;
+#endif
     if (getenv("WAYLAND_DISPLAY") != NULL) {
         errx(EXIT_FAILURE, "i3lock is a program for X11 and does not work on Wayland. Try https://github.com/swaywm/swaylock instead");
     }
@@ -1126,16 +1150,8 @@ int main(int argc, char *argv[]) {
      * the unlock indicator upon keypresses. */
     srand(time(NULL));
 
-#ifndef __OpenBSD__
-    /* Initialize PAM */
-    if ((ret = pam_start("i3lock", username, &conv, &pam_handle)) != PAM_SUCCESS) {
-        errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
-    }
-
-    if ((ret = pam_set_item(pam_handle, PAM_TTY, getenv("DISPLAY"))) != PAM_SUCCESS) {
-        errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
-    }
-#endif
+    /* PAM initialisation has moved to pam_controller_init(), called from
+     * the first XCB_MAP_NOTIFY handler after the daemonisation fork. */
 
 /* Using mlock() as non-super-user seems only possible in Linux.
  * Users of other operating systems should use encrypted swap/no swap
@@ -1325,9 +1341,8 @@ int main(int argc, char *argv[]) {
     ev_loop(main_loop, 0);
 
 #ifndef __OpenBSD__
-    if (pam_cleanup) {
-        pam_end(pam_handle, PAM_SUCCESS);
-    }
+    pam_controller_cleanup();
+    free(pam_watcher);
 #endif
 
     if (stolen_focus == XCB_NONE) {
