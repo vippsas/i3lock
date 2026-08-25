@@ -212,6 +212,17 @@ static void clear_password_memory(void) {
 #endif
 }
 
+static void clear_pam_visible_input(void) {
+#ifdef HAVE_EXPLICIT_BZERO
+    explicit_bzero(pam_visible_input, sizeof(pam_visible_input));
+#else
+    volatile char *vinput = pam_visible_input;
+    for (size_t c = 0; c < sizeof(pam_visible_input); c++) {
+        vinput[c] = 0;
+    }
+#endif
+}
+
 ev_timer *start_timer(ev_timer *timer_obj, ev_tstamp timeout, ev_callback_t callback) {
     if (timer_obj) {
         ev_timer_stop(main_loop, timer_obj);
@@ -286,7 +297,7 @@ static void clear_input(void) {
     input_position = 0;
     clear_password_memory();
     password[input_position] = '\0';
-    pam_visible_input[0] = '\0';
+    clear_pam_visible_input();
 }
 
 static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
@@ -321,13 +332,14 @@ static void auth_failed(void) {
 static void clear_pam_display_text(void) {
     pam_status_text[0] = '\0';
     pam_prompt_text[0] = '\0';
-    pam_visible_input[0] = '\0';
+    clear_pam_visible_input();
     pam_status_is_error = false;
     pam_prompt_echo_on = false;
     pam_status_expires_with_auth_wrong = false;
 }
 
 static void update_pam_visible_input(void) {
+    clear_pam_visible_input();
     if (pam_prompt_echo_on) {
         size_t len = strlen(password);
         if (len >= sizeof(pam_visible_input)) {
@@ -335,8 +347,6 @@ static void update_pam_visible_input(void) {
         }
         memcpy(pam_visible_input, password, len);
         pam_visible_input[len] = '\0';
-    } else {
-        pam_visible_input[0] = '\0';
     }
 }
 
@@ -364,7 +374,7 @@ static void handle_pam_event(const pam_event_t *event) {
             pam_waiting_for_prompt = true;
             snprintf(pam_prompt_text, sizeof(pam_prompt_text), "%s", event->text);
             pam_prompt_echo_on = event->echo_on;
-            pam_visible_input[0] = '\0';
+            clear_pam_visible_input();
             auth_state = STATE_AUTH_IDLE;
             unlock_state = STATE_KEY_PRESSED;
             clear_input();
@@ -485,7 +495,7 @@ static void input_done(void) {
         pam_waiting_for_prompt = false;
         active_pam_prompt_id = 0;
         pam_prompt_text[0] = '\0';
-        pam_visible_input[0] = '\0';
+        clear_pam_visible_input();
         pam_prompt_echo_on = false;
         auth_state = STATE_AUTH_VERIFY;
         if (!pam_controller_submit_answer(transaction_id, prompt_id, password)) {
@@ -1079,10 +1089,19 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
 #ifndef __OpenBSD__
                 if (!controller_started) {
                     controller_started = true;
-                    pam_controller_init(saved_username, getenv("DISPLAY"));
                     pam_watcher = calloc(1, sizeof(struct ev_io));
                     if (pam_watcher == NULL) {
-                        errx(EXIT_FAILURE, "calloc pam_watcher");
+                        fprintf(stderr, "[i3lock] could not allocate PAM event watcher\n");
+                        auth_state = STATE_I3LOCK_LOCK_FAILED;
+                        redraw_screen();
+                        break;
+                    }
+                    if (!pam_controller_init(saved_username, getenv("DISPLAY"))) {
+                        free(pam_watcher);
+                        pam_watcher = NULL;
+                        auth_state = STATE_I3LOCK_LOCK_FAILED;
+                        redraw_screen();
+                        break;
                     }
                     ev_io_init(pam_watcher, pam_event_cb,
                                pam_controller_get_fd(), EV_READ);
@@ -1302,6 +1321,9 @@ int main(int argc, char *argv[]) {
      * be swapped to disk. Since Linux 2.6.9, this does not require any
      * privileges, just enough bytes in the RLIMIT_MEMLOCK limit. */
     if (mlock(password, sizeof(password)) != 0) {
+        err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
+    }
+    if (mlock(pam_visible_input, sizeof(pam_visible_input)) != 0) {
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
     }
 #endif

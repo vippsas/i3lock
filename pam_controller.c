@@ -80,6 +80,10 @@ static struct {
     bool waiting_for_answer;
     bool answer_submitted;
     bool fatal_error;
+    bool pipe_created;
+    bool secure_mlocked;
+    bool mutex_initialised;
+    bool cond_initialised;
 
     /* Transaction tracking. */
     uint64_t next_transaction_id;
@@ -110,11 +114,8 @@ static void post_event_locked(pam_event_t event) {
     if (ctrl.event_count < MAX_EVENTS) {
         ctrl.events[ctrl.event_count++] = event;
     } else {
-        ctrl.events[MAX_EVENTS - 1] = (pam_event_t){
-            .type = PAM_EVENT_AUTH_FATAL,
-            .transaction_id = event.transaction_id,
-            .prompt_id = event.prompt_id,
-        };
+        memmove(ctrl.events, ctrl.events + 1, (MAX_EVENTS - 1) * sizeof(ctrl.events[0]));
+        ctrl.events[MAX_EVENTS - 1] = event;
     }
     char byte = 0;
     (void)write(ctrl.pipe_fds[1], &byte, 1);
@@ -154,21 +155,20 @@ static int worker_conv_callback(int num_msg,
                                 struct pam_response **resp,
                                 void *appdata_ptr);
 
-static int start_pam_handle(void) {
-    ctrl.pam_conv = (struct pam_conv){worker_conv_callback, NULL};
-    int ret = pam_start("i3lock", ctrl.username, &ctrl.pam_conv, &ctrl.pam_handle);
+static int start_pam_handle(pam_handle_t **handle) {
+    *handle = NULL;
+    int ret = pam_start("i3lock", ctrl.username, &ctrl.pam_conv, handle);
     if (ret != PAM_SUCCESS) {
         fprintf(stderr, "[i3lock] PAM worker: pam_start failed (%d)\n", ret);
-        ctrl.pam_handle = NULL;
         return ret;
     }
 
     if (ctrl.display != NULL) {
-        ret = pam_set_item(ctrl.pam_handle, PAM_TTY, ctrl.display);
+        ret = pam_set_item(*handle, PAM_TTY, ctrl.display);
         if (ret != PAM_SUCCESS) {
             fprintf(stderr, "[i3lock] PAM worker: pam_set_item(PAM_TTY) failed (%d)\n", ret);
-            pam_end(ctrl.pam_handle, ret);
-            ctrl.pam_handle = NULL;
+            pam_end(*handle, ret);
+            *handle = NULL;
             return ret;
         }
     }
@@ -176,11 +176,35 @@ static int start_pam_handle(void) {
     return PAM_SUCCESS;
 }
 
-static void end_pam_handle(int status) {
-    if (ctrl.pam_handle != NULL) {
-        pam_end(ctrl.pam_handle, status);
-        ctrl.pam_handle = NULL;
+static void end_pam_handle(pam_handle_t *handle, int status) {
+    if (handle != NULL) {
+        pam_end(handle, status);
     }
+}
+
+static void reset_controller_init_state(void) {
+    if (ctrl.secure != NULL) {
+        secure_wipe(ctrl.secure, sizeof(*ctrl.secure));
+#if defined(__linux__)
+        if (ctrl.secure_mlocked) {
+            munlock(ctrl.secure, sizeof(*ctrl.secure));
+        }
+#endif
+        free(ctrl.secure);
+    }
+    if (ctrl.pipe_created) {
+        close(ctrl.pipe_fds[0]);
+        close(ctrl.pipe_fds[1]);
+    }
+    if (ctrl.cond_initialised) {
+        pthread_cond_destroy(&ctrl.cond);
+    }
+    if (ctrl.mutex_initialised) {
+        pthread_mutex_destroy(&ctrl.mutex);
+    }
+    free(ctrl.username);
+    free(ctrl.display);
+    memset(&ctrl, 0, sizeof(ctrl));
 }
 
 /* pam_conv callback, running in the worker thread */
@@ -299,7 +323,8 @@ static void *worker_main(void *arg) {
     (void)arg;
 
     /* Initialise the PAM handle. The worker owns it exclusively. */
-    int ret = start_pam_handle();
+    pam_handle_t *handle = NULL;
+    int ret = start_pam_handle(&handle);
     if (ret != PAM_SUCCESS) {
         pthread_mutex_lock(&ctrl.mutex);
         post_event_locked((pam_event_t){
@@ -312,6 +337,7 @@ static void *worker_main(void *arg) {
     }
 
     pthread_mutex_lock(&ctrl.mutex);
+    ctrl.pam_handle = handle;
     post_event_locked((pam_event_t){
         .type = PAM_EVENT_AUTH_READY,
         .transaction_id = 0,
@@ -334,15 +360,15 @@ static void *worker_main(void *arg) {
         ctrl.waiting_prompt_id = 0;
         ctrl.prompts_seen = 0;
         uint64_t txn = ctrl.active_transaction_id;
+        handle = ctrl.pam_handle;
         pthread_mutex_unlock(&ctrl.mutex);
 
         /* pam_authenticate blocks and invokes worker_conv_callback. */
-        ret = pam_authenticate(ctrl.pam_handle, 0);
+        ret = pam_authenticate(handle, 0);
 
         pthread_mutex_lock(&ctrl.mutex);
         secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
         secure_wipe(ctrl.secure->pending_response, SECURE_BUFFER_SIZE);
-        ctrl.auth_in_progress = false;
         ctrl.waiting_for_answer = false;
         ctrl.answer_submitted = false;
         ctrl.waiting_prompt_id = 0;
@@ -358,7 +384,7 @@ static void *worker_main(void *arg) {
             /* Refresh credentials (Kerberos tickets, etc.).
              * Do not downgrade a successful authentication if
              * credential refresh fails. */
-            pam_setcred(ctrl.pam_handle, PAM_REFRESH_CRED);
+            pam_setcred(handle, PAM_REFRESH_CRED);
             post_event_locked((pam_event_t){
                 .type = PAM_EVENT_AUTH_SUCCESS,
                 .transaction_id = txn,
@@ -376,8 +402,9 @@ static void *worker_main(void *arg) {
             event_set_text(&event, "Authentication service failed");
             ctrl.fatal_error = true;
             post_event_locked(event);
+            ctrl.pam_handle = NULL;
             pthread_mutex_unlock(&ctrl.mutex);
-            end_pam_handle(ret);
+            end_pam_handle(handle, ret);
             pthread_mutex_lock(&ctrl.mutex);
         } else if (ret == PAM_SYSTEM_ERR || ret == PAM_SERVICE_ERR) {
             pam_event_t event = {
@@ -389,12 +416,15 @@ static void *worker_main(void *arg) {
             };
             event_set_text(&event, "Authentication service error");
             post_event_locked(event);
+            ctrl.pam_handle = NULL;
 
             pthread_mutex_unlock(&ctrl.mutex);
-            end_pam_handle(ret);
-            ret = start_pam_handle();
+            end_pam_handle(handle, ret);
+            handle = NULL;
+            ret = start_pam_handle(&handle);
             pthread_mutex_lock(&ctrl.mutex);
             if (ret == PAM_SUCCESS) {
+                ctrl.pam_handle = handle;
                 post_event_locked((pam_event_t){
                     .type = PAM_EVENT_AUTH_READY,
                     .transaction_id = 0,
@@ -421,31 +451,36 @@ static void *worker_main(void *arg) {
                 .echo_on = 0,
             });
         }
+        ctrl.auth_in_progress = false;
     }
+    handle = ctrl.pam_handle;
+    ctrl.pam_handle = NULL;
     pthread_mutex_unlock(&ctrl.mutex);
 
-    end_pam_handle(PAM_SUCCESS);
+    end_pam_handle(handle, PAM_SUCCESS);
     return NULL;
 }
 
 /* public API */
 
-void pam_controller_init(const char *username, const char *display) {
+int pam_controller_init(const char *username, const char *display) {
     if (ctrl.initialised) {
-        return;
+        return 1;
     }
 
     /* Copy configuration strings. */
     ctrl.username = strdup(username);
     if (ctrl.username == NULL) {
         perror("strdup");
-        exit(EXIT_FAILURE);
+        reset_controller_init_state();
+        return 0;
     }
     if (display != NULL) {
         ctrl.display = strdup(display);
         if (ctrl.display == NULL) {
             perror("strdup");
-            exit(EXIT_FAILURE);
+            reset_controller_init_state();
+            return 0;
         }
     }
 
@@ -453,48 +488,65 @@ void pam_controller_init(const char *username, const char *display) {
     ctrl.secure = calloc(1, sizeof(*ctrl.secure));
     if (ctrl.secure == NULL) {
         perror("calloc");
-        exit(EXIT_FAILURE);
+        reset_controller_init_state();
+        return 0;
     }
 #if defined(__linux__)
     if (mlock(ctrl.secure, sizeof(*ctrl.secure)) != 0) {
         perror("mlock(secure storage)");
-        exit(EXIT_FAILURE);
+        reset_controller_init_state();
+        return 0;
     }
+    ctrl.secure_mlocked = true;
 #endif
 
     /* Create the wake-up pipe. The read end is non-blocking so that
      * drain_events never stalls the event loop. */
     if (pipe(ctrl.pipe_fds) != 0) {
         perror("pipe");
-        exit(EXIT_FAILURE);
+        reset_controller_init_state();
+        return 0;
     }
+    ctrl.pipe_created = true;
     int flags = fcntl(ctrl.pipe_fds[0], F_GETFL);
     if (flags == -1 || fcntl(ctrl.pipe_fds[0], F_SETFL, flags | O_NONBLOCK) == -1) {
         perror("fcntl(O_NONBLOCK)");
-        exit(EXIT_FAILURE);
+        reset_controller_init_state();
+        return 0;
     }
     flags = fcntl(ctrl.pipe_fds[1], F_GETFL);
     if (flags == -1 || fcntl(ctrl.pipe_fds[1], F_SETFL, flags | O_NONBLOCK) == -1) {
         perror("fcntl(O_NONBLOCK)");
-        exit(EXIT_FAILURE);
+        reset_controller_init_state();
+        return 0;
     }
 
     /* Initialise synchronisation primitives. */
-    if (pthread_mutex_init(&ctrl.mutex, NULL) != 0 ||
-        pthread_cond_init(&ctrl.cond, NULL) != 0) {
-        fprintf(stderr, "[i3lock] could not initialise mutex/condvar\n");
-        exit(EXIT_FAILURE);
+    if (pthread_mutex_init(&ctrl.mutex, NULL) != 0) {
+        fprintf(stderr, "[i3lock] could not initialise mutex\n");
+        reset_controller_init_state();
+        return 0;
     }
+    ctrl.mutex_initialised = true;
+    if (pthread_cond_init(&ctrl.cond, NULL) != 0) {
+        fprintf(stderr, "[i3lock] could not initialise condvar\n");
+        reset_controller_init_state();
+        return 0;
+    }
+    ctrl.cond_initialised = true;
 
     ctrl.next_transaction_id = 1;
     ctrl.next_prompt_id = 1;
-    ctrl.initialised = true;
+    ctrl.pam_conv = (struct pam_conv){worker_conv_callback, NULL};
 
     /* Start the worker thread. */
     if (pthread_create(&ctrl.worker, NULL, worker_main, NULL) != 0) {
         perror("pthread_create");
-        exit(EXIT_FAILURE);
+        reset_controller_init_state();
+        return 0;
     }
+    ctrl.initialised = true;
+    return 1;
 }
 
 uint64_t pam_controller_start_auth(const char *password) {
@@ -506,7 +558,8 @@ uint64_t pam_controller_start_auth(const char *password) {
     if (ctrl.auth_requested ||
         ctrl.auth_in_progress ||
         ctrl.shutdown_requested ||
-        ctrl.fatal_error) {
+        ctrl.fatal_error ||
+        ctrl.pam_handle == NULL) {
         pthread_mutex_unlock(&ctrl.mutex);
         return 0;
     }

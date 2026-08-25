@@ -33,7 +33,7 @@ typedef struct {
  *
  * username and display are copied internally.
  */
-void pam_controller_init(const char *username, const char *display);
+int pam_controller_init(const char *username, const char *display);
 
 /*
  * Stage the password and start authentication.  The password is copied
