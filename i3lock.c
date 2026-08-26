@@ -431,6 +431,10 @@ static void handle_pam_event(const pam_event_t *event) {
             return;
 
         case PAM_EVENT_AUTH_FATAL:
+            if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
+                return;
+            }
             active_pam_transaction_id = 0;
             active_pam_prompt_id = 0;
             pam_waiting_for_prompt = false;

@@ -479,7 +479,7 @@ static void *worker_main(void *arg) {
                 .prompt_id = 0,
                 .echo_on = 0,
             });
-        } else if (ret == PAM_ABORT || ret == PAM_MAXTRIES) {
+        } else if (ret == PAM_ABORT) {
             pam_event_t event = {
                 .type = PAM_EVENT_AUTH_FATAL,
                 .transaction_id = txn,
