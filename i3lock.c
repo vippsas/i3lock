@@ -383,6 +383,7 @@ static void handle_pam_event(const pam_event_t *event) {
 
         case PAM_EVENT_AUTH_SUCCESS:
             if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
                 return;
             }
             DEBUG("successfully authenticated\n");
@@ -391,11 +392,13 @@ static void handle_pam_event(const pam_event_t *event) {
             pam_waiting_for_prompt = false;
             clear_pam_display_text();
             clear_password_memory();
+            pam_controller_ack_terminal(event->transaction_id);
             ev_break(EV_DEFAULT, EVBREAK_ALL);
             return;
 
         case PAM_EVENT_AUTH_FAILURE:
             if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
                 return;
             }
             active_pam_transaction_id = 0;
@@ -410,10 +413,12 @@ static void handle_pam_event(const pam_event_t *event) {
                 clear_pam_display_text();
             }
             auth_failed();
+            pam_controller_ack_terminal(event->transaction_id);
             return;
 
         case PAM_EVENT_AUTH_CANCELLED:
             if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
                 return;
             }
             active_pam_transaction_id = 0;
@@ -422,6 +427,7 @@ static void handle_pam_event(const pam_event_t *event) {
             clear_pam_display_text();
             auth_state = STATE_AUTH_IDLE;
             redraw_screen();
+            pam_controller_ack_terminal(event->transaction_id);
             return;
 
         case PAM_EVENT_AUTH_FATAL:
@@ -440,6 +446,7 @@ static void handle_pam_event(const pam_event_t *event) {
             auth_state = STATE_I3LOCK_LOCK_FAILED;
             clear_input();
             redraw_screen();
+            pam_controller_ack_terminal(event->transaction_id);
             return;
     }
 }

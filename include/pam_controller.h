@@ -27,9 +27,10 @@ typedef struct {
 } pam_event_t;
 
 /*
- * Initialize the PAM controller: create worker thread, pipe, secure
- * storage, and PAM handle.  Must be called exactly once, after all
- * forks are complete.  Aborts on failure.
+ * Initialize the PAM controller: create worker thread, pipe, and secure
+ * storage. PAM handles are created fresh for each authentication attempt.
+ * Must be called exactly once, after all forks are complete. Returns 1 on
+ * success and 0 on failure; failures must leave i3lock locked.
  *
  * username and display are copied internally.
  */
@@ -39,7 +40,7 @@ int pam_controller_init(const char *username, const char *display);
  * Stage the password and start authentication.  The password is copied
  * into mlocked storage; the caller should wipe its own copy afterward.
  * Returns the transaction ID of the new authentication attempt, or 0 if
- * the controller has not been initialized yet.
+ * the controller is not ready to accept a fresh attempt.
  */
 uint64_t pam_controller_start_auth(const char *password);
 
@@ -59,6 +60,13 @@ int pam_controller_submit_answer(uint64_t transaction_id,
  * the worker observes cancellation before the next prompt or terminal event.
  */
 void pam_controller_cancel_auth(uint64_t transaction_id);
+
+/*
+ * Acknowledge that the UI has consumed and committed a terminal event for
+ * a transaction. Until this happens, the controller will not accept another
+ * authentication attempt for that transaction slot.
+ */
+void pam_controller_ack_terminal(uint64_t transaction_id);
 
 /*
  * Returns the file descriptor that the main event loop should watch for
