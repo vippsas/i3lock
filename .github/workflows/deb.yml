@@ -1,0 +1,109 @@
+name: Build .deb package
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    name: Build .deb (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          build-essential meson ninja-build pkg-config dpkg-dev \
+          libpam0g-dev libcairo2-dev libxcb1-dev libxcb-dpms0-dev \
+          libxcb-image0-dev libxcb-util0-dev libxcb-randr0-dev \
+          libxcb-xinerama0-dev libxcb-xkb-dev libxcb-xrm-dev \
+          libev-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+    - name: Configure and build
+      run: |
+        meson setup build --prefix=/usr --buildtype=release
+        ninja -C build
+
+    - name: Stage install
+      run: |
+        DESTDIR="$PWD/pkgroot" ninja -C build install
+
+    - name: Assemble Debian package
+      id: pkg
+      run: |
+        set -eu
+        VERSION="$(meson introspect meson.build --projectinfo | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+        # Append git revision for non-tag builds so packages are distinguishable.
+        if [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then
+          VERSION="${VERSION}+git$(git rev-parse --short HEAD)"
+        fi
+        ARCH="$(dpkg --print-architecture)"
+        PKGROOT="$PWD/pkgroot"
+
+        mkdir -p "$PKGROOT/DEBIAN"
+        # dpkg-shlibdeps requires a debian/control context to resolve the
+        # package dependencies of the binary's linked shared libraries.
+        mkdir -p debian
+        cat > debian/control <<'CONTROL'
+        Source: i3lock
+        Section: x11
+        Priority: optional
+        Maintainer: i3lock packagers <noreply@github.com>
+
+        Package: i3lock
+        Architecture: any
+        Description: improved screen locker
+        CONTROL
+        DEPENDS="$(dpkg-shlibdeps -O "$PKGROOT/usr/bin/i3lock" 2>/dev/null | sed 's/^shlibs:Depends=//')"
+        rm -rf debian
+
+        INSTALLED_SIZE="$(du -k -s "$PKGROOT/usr" | cut -f1)"
+
+        cat > "$PKGROOT/DEBIAN/control" <<EOF
+        Package: i3lock
+        Version: ${VERSION}
+        Section: x11
+        Priority: optional
+        Architecture: ${ARCH}
+        Installed-Size: ${INSTALLED_SIZE}
+        Depends: ${DEPENDS}
+        Maintainer: i3lock packagers <noreply@github.com>
+        Homepage: https://i3wm.org/i3lock/
+        Description: improved screen locker
+         i3lock is a simple screen locker like slock. After starting it, you
+         will see a screen (you can configure the color or an image) and you
+         can return to your screen by entering your password. i3lock uses PAM
+         and is therefore compatible with LDAP, etc.
+        EOF
+
+        DEB="i3lock_${VERSION}_${ARCH}.deb"
+        dpkg-deb --root-owner-group --build "$PKGROOT" "$DEB"
+        dpkg-deb --info "$DEB"
+        dpkg-deb --contents "$DEB"
+        echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+
+    - name: Upload package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: i3lock-deb-${{ matrix.os }}
+        path: ${{ steps.pkg.outputs.deb }}
+        if-no-files-found: error
+
+    - name: Attach package to release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ steps.pkg.outputs.deb }}
