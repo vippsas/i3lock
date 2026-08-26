@@ -35,8 +35,8 @@ Gate: make test passes against unmodified local i3lock.
 - The earlier raise-loop fork has already completed by this point. No i3lock fork may occur after controller
   initialization.
 
-- The worker owns pam_start, pam_set_item, pam_authenticate, pam_setcred, and pam_end. It creates/configures an idle
-  handle after startup but does not authenticate yet.
+- The worker owns pam_start, pam_set_item, pam_authenticate, pam_setcred, and pam_end. It creates a fresh PAM handle for
+  each explicit authentication attempt and ends that handle before accepting another attempt.
 
 - Add the fundamental safety mechanisms now:
   - monotonic transaction IDs and prompt IDs;
@@ -55,7 +55,7 @@ Use these explicit controller states:
 
 State                Meaning and allowed transition
 ━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-IDLE                 PAM handle ready; user may type. Enter stages one deferred submission and moves to AUTH_STARTING.
+IDLE                 Controller ready; user may type. Enter stages one deferred submission and moves to AUTH_STARTING.
 ───────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────
 AUTH_STARTING        Worker begins pam_authenticate(). It moves to AUTH_RUNNING or WAITING_PROMPT. Escape moves to
 AUTH_CANCELLING.
@@ -67,7 +67,7 @@ WAITING_PROMPT       One identified prompt waits for a matching fresh answer. Su
 to AUTH_CANCELLING.
 ───────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────
 AUTH_CANCELLING      Transaction is invalidated and UI is idle-looking; worker cleanup is outstanding. A later Enter is
-retained as pending intent. Completion moves to IDLE or immediately starts that pending intent.
+rejected and its input is cleared. The user must submit again after cleanup completes.
 ───────────────────  ─────────────────────────────────────────────────────────────────────────────────────────────────────
 AUTH_FAILED_DELAY    Active transaction has completed unsuccessfully; existing Wrong! delay applies. Input/Enter queues
 one retry. Timer expiry moves to IDLE or starts the queued retry.
@@ -95,8 +95,10 @@ not retry.
     PAM; the worker checks cancellation before the next prompt and again after pam_authenticate() returns.
 
   - A cancelled transaction never refreshes credentials or unlocks, even if PAM later returns success.
-  - The UI does not block waiting for worker termination. One pending post-cancel user submission is stored only in the
-    bounded mlocked controller buffer until cleanup completes.
+  - The UI does not block waiting for worker termination.
+  - A submission made while cancellation cleanup is still pending is not queued. i3lock clears that input and requires a
+    fresh Enter after cleanup completes. Retaining a post-cancel submission would require a separate mlocked snapshot
+    buffer and is intentionally out of scope for this branch.
 
 - Map controller states onto the existing indicator enums without replacing their current meaning: AUTH_STARTING and
   AUTH_RUNNING use STATE_AUTH_VERIFY; WAITING_PROMPT uses normal input/STATE_AUTH_IDLE presentation; AUTH_FAILED_DELAY
