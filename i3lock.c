@@ -1013,7 +1013,6 @@ static bool verify_png_image(const char *image_path) {
     return true;
 }
 
-/* conv_callback has moved to pam_controller.c (worker_conv_callback). */
 
 /*
  * This callback is only a dummy, see xcb_prepare_cb and xcb_check_cb.
