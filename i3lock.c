@@ -1119,7 +1119,6 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 }
 #ifndef __OpenBSD__
                 if (!controller_started) {
-                    controller_started = true;
                     pam_watcher = calloc(1, sizeof(struct ev_io));
                     if (pam_watcher == NULL) {
                         fprintf(stderr, "[i3lock] could not allocate PAM event watcher\n");
@@ -1137,6 +1136,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                     ev_io_init(pam_watcher, pam_event_cb,
                                pam_controller_get_fd(), EV_READ);
                     ev_io_start(main_loop, pam_watcher);
+                    controller_started = true;
                 }
 #endif
                 break;
