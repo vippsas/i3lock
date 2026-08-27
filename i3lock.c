@@ -1013,7 +1013,6 @@ static bool verify_png_image(const char *image_path) {
     return true;
 }
 
-
 /*
  * This callback is only a dummy, see xcb_prepare_cb and xcb_check_cb.
  * See also man libev(3): "ev_prepare" and "ev_check" - customise your event loop

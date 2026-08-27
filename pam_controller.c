@@ -446,7 +446,9 @@ static void *worker_main(void *arg) {
         if (ret == PAM_SUCCESS && !cancellation_requested_locked_read()) {
             int setcred_ret = pam_setcred(handle, PAM_REFRESH_CRED);
             if (setcred_ret != PAM_SUCCESS) {
-                fprintf(stderr, "[i3lock] PAM worker: pam_setcred(PAM_REFRESH_CRED) failed (%d)\n", setcred_ret);
+                fprintf(stderr,
+                        "[i3lock] PAM worker: pam_setcred(PAM_REFRESH_CRED) failed (%d)\n",
+                        setcred_ret);
                 terminal_status = setcred_ret;
             }
         }
