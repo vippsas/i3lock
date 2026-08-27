@@ -441,11 +441,11 @@ void draw_image(xcb_pixmap_t bg_pixmap, uint32_t *resolution) {
             display_centered_text_bounded(ctx, pam_status_text, 28., PAM_TEXT_MAX_WIDTH);
         }
 
-        if (modifier_string != NULL) {
+        if (modifier_string != NULL && pam_status_text[0] == '\0') {
             cairo_set_font_size(ctx, 14.0);
             display_button_text(ctx, modifier_string, 28., use_dark_text);
         }
-        if (show_keyboard_layout && layout_string != NULL) {
+        if (show_keyboard_layout && layout_string != NULL && pam_prompt_text[0] == '\0') {
             cairo_set_font_size(ctx, 14.0);
             display_button_text(ctx, layout_string, -28., use_dark_text);
         }
