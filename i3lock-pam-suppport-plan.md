@@ -176,6 +176,11 @@ while Himmelblau PIN/password/MFA text is understandable and survives retry dela
 - Follow-up cleanup: avoid exporting PAM display globals directly through `unlock_indicator.h`. Prefer a narrow
   renderer-facing boundary, either a `struct pam_display_state` passed to the renderer or a small setter/getter API owned
   by `i3lock.c`. This is architectural cleanup, not a correctness gate for the sequential PAM work.
+- Follow-up UI improvement: replace the current one-line ellipsized PAM prompt/status rendering with a real bounded
+  multi-line text layout. A practical next iteration is to reserve a rectangular text region below the indicator, split
+  provider text on UTF-8 word boundaries, render at most two status lines plus one prompt line, and ellipsize only the
+  final visible line. This should be implemented together with the renderer-boundary cleanup so layout decisions are not
+  spread across exported PAM globals.
 - Review each terminal path for pam_end status, transaction retirement, worker cleanup, and secret wiping.
 - Update i3lock documentation for:
   - sequential standard PAM conversations;
