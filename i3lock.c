@@ -124,6 +124,17 @@ static void u8_dec(char *s, int *i) {
     (void)(isutf(s[--(*i)]) || isutf(s[--(*i)]) || isutf(s[--(*i)]) || --(*i));
 }
 
+static bool is_utf8_continuation_byte(unsigned char byte) {
+    return (byte & 0xC0) == 0x80;
+}
+
+static size_t utf8_truncate_to_char_boundary(const char *s, size_t len) {
+    while (len > 0 && is_utf8_continuation_byte((unsigned char)s[len])) {
+        len--;
+    }
+    return len;
+}
+
 /*
  * Loads the XKB keymap from the X11 server and feeds it to xkbcommon.
  * Necessary so that we can properly let xkbcommon track the keyboard state and
@@ -344,6 +355,7 @@ static void update_pam_visible_input(void) {
         size_t len = strlen(password);
         if (len >= sizeof(pam_visible_input)) {
             len = sizeof(pam_visible_input) - 1;
+            len = utf8_truncate_to_char_boundary(password, len);
         }
         memcpy(pam_visible_input, password, len);
         pam_visible_input[len] = '\0';
