@@ -82,6 +82,7 @@ static struct {
     bool cancellation_requested;
     bool waiting_for_answer;
     bool answer_submitted;
+    bool deferred_input_submitted;
     bool fatal_error;
     bool terminal_ack_pending;
     bool pipe_created;
@@ -311,12 +312,13 @@ static int worker_conv_callback(int num_msg,
             ctrl.prompts_seen++;
             bool use_deferred = ctrl.prompts_seen == 1 &&
                                 style == PAM_PROMPT_ECHO_OFF &&
-                                ctrl.secure->deferred_input[0] != '\0';
+                                ctrl.deferred_input_submitted;
 
             if (use_deferred) {
                 int result = copy_secure_value_to_response(&reply[i].resp,
                                                            ctrl.secure->deferred_input);
                 secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+                ctrl.deferred_input_submitted = false;
                 if (result != PAM_SUCCESS) {
                     pthread_mutex_unlock(&ctrl.mutex);
                     free_replies(reply, num_msg);
@@ -327,6 +329,7 @@ static int worker_conv_callback(int num_msg,
             }
 
             secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+            ctrl.deferred_input_submitted = false;
             uint64_t prompt_id = ctrl.next_prompt_id++;
             ctrl.waiting_prompt_id = prompt_id;
             ctrl.waiting_for_answer = true;
@@ -461,6 +464,7 @@ static void *worker_main(void *arg) {
 
         pthread_mutex_lock(&ctrl.mutex);
         secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+        ctrl.deferred_input_submitted = false;
         secure_wipe(ctrl.secure->pending_response, SECURE_BUFFER_SIZE);
         ctrl.waiting_for_answer = false;
         ctrl.answer_submitted = false;
@@ -648,6 +652,7 @@ uint64_t pam_controller_start_auth(const char *password) {
     }
     memcpy(ctrl.secure->deferred_input, password, len);
     ctrl.secure->deferred_input[len] = '\0';
+    ctrl.deferred_input_submitted = true;
 
     uint64_t txn = ctrl.next_transaction_id++;
     ctrl.active_transaction_id = txn;
@@ -712,6 +717,7 @@ void pam_controller_cancel_auth(uint64_t transaction_id) {
         ctrl.cancellation_requested = true;
         ctrl.auth_requested = false;
         secure_wipe(ctrl.secure->deferred_input, SECURE_BUFFER_SIZE);
+        ctrl.deferred_input_submitted = false;
         secure_wipe(ctrl.secure->pending_response, SECURE_BUFFER_SIZE);
         pthread_cond_signal(&ctrl.cond);
     }
