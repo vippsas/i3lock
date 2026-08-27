@@ -141,6 +141,31 @@ while Himmelblau PIN/password/MFA text is understandable and survives retry dela
 
 ## 5. Stabilize and document
 
+### Approved authentication policy
+
+- A completed PAM attempt is always retired with `pam_end()` before i3lock
+  accepts another submission. This includes `PAM_MAXTRIES`; it terminates the
+  current transaction, not i3lock itself.
+- `PAM_MAXTRIES` follows the normal failed-attempt path: i3lock remains locked,
+  clears the submitted input, applies the existing retry delay, and requires a
+  new explicit Enter to create a fresh PAM transaction. It never reuses the
+  exhausted handle or queues input while cleanup is pending. This preserves
+  recovery when a provider or one of its methods reaches a transaction-local
+  limit, while provider-wide lockout and rate-limiting policy remain enforced
+  by the configured PAM stack.
+- `PAM_ABORT` remains fatal: i3lock stays locked and does not start another
+  transaction.
+- `pam_authenticate()` and `pam_acct_mgmt()` must both succeed before i3lock
+  can unlock. Their failures are fail-closed.
+- After those checks succeed, `pam_setcred(PAM_REFRESH_CRED)` is best-effort.
+  A refresh failure is logged and supplied as the status to `pam_end()`, but it
+  does not revoke the successful unlock. This availability policy is approved
+  for the organization’s supported PAM profiles.
+- Harness coverage must keep asserting these decisions: a fresh handle after
+  `PAM_MAXTRIES`, no retained submission during cancellation cleanup,
+  fail-closed account-management failure, and successful unlock after a
+  credential-refresh failure.
+
 - Exercise daemonizing, --nofork, cancellation, late completion, retry, and repeated cleanup paths.
 - The worker exclusively owns every PAM handle. On successful, non-cancelled authentication it calls
   pam_setcred(PAM_REFRESH_CRED) before posting success, then calls pam_end; the main thread never accesses that handle.
