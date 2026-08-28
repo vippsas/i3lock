@@ -442,8 +442,13 @@ static void *worker_main(void *arg) {
         }
 
         if (ret == PAM_SUCCESS && !cancellation_requested_locked_read()) {
-            ret = pam_acct_mgmt(handle, 0);
-            terminal_status = ret;
+            int acct_ret = pam_acct_mgmt(handle, 0);
+            if (acct_ret != PAM_SUCCESS) {
+                fprintf(stderr,
+                        "[i3lock] PAM worker: pam_acct_mgmt() failed (%d)\n",
+                        acct_ret);
+                terminal_status = acct_ret;
+            }
         }
 
         if (ret == PAM_SUCCESS && !cancellation_requested_locked_read()) {

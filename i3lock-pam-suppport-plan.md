@@ -155,21 +155,26 @@ while Himmelblau PIN/password/MFA text is understandable and survives retry dela
   by the configured PAM stack.
 - `PAM_ABORT` remains fatal: i3lock stays locked and does not start another
   transaction.
-- `pam_authenticate()` and `pam_acct_mgmt()` must both succeed before i3lock
-  can unlock. Their failures are fail-closed.
-- After those checks succeed, `pam_setcred(PAM_REFRESH_CRED)` is best-effort.
-  A refresh failure is logged and supplied as the status to `pam_end()`, but it
-  does not revoke the successful unlock. This availability policy is approved
-  for the organization’s supported PAM profiles.
+- i3lock follows reauthentication/unlock semantics, not first-login/session
+  creation semantics. `pam_authenticate()` is the unlock boundary: when it
+  succeeds and the transaction was not cancelled or malformed, i3lock can
+  unlock.
+- After successful authentication, `pam_acct_mgmt()` and
+  `pam_setcred(PAM_REFRESH_CRED)` are best-effort post-authentication calls.
+  Their failures are logged and supplied as the status to `pam_end()`, but they
+  do not revoke the successful unlock. This preserves existing i3lock behaviour
+  and matches the model used by display managers for reauthenticating an
+  already logged-in session.
 - Harness coverage must keep asserting these decisions: a fresh handle after
   `PAM_MAXTRIES`, no retained submission during cancellation cleanup,
-  fail-closed account-management failure, and successful unlock after a
-  credential-refresh failure.
+  successful unlock after an account-management failure, and successful unlock
+  after a credential-refresh failure.
 
 - Exercise daemonizing, --nofork, cancellation, late completion, retry, and repeated cleanup paths.
 - The worker exclusively owns every PAM handle. On successful, non-cancelled authentication it calls
-  pam_setcred(PAM_REFRESH_CRED) before posting success, then calls pam_end; the main thread never accesses that handle.
-  Preserve current behaviour by not downgrading a successful authentication solely because credential refresh fails.
+  pam_acct_mgmt() and pam_setcred(PAM_REFRESH_CRED) before posting success, then calls pam_end; the main thread never
+  accesses that handle. Preserve current unlock behaviour by not downgrading a successful authentication solely because
+  account management or credential refresh fails.
 - Define terminal PAM errors explicitly: PAM_ABORT ends its handle and enters AUTH_FATAL, leaving i3lock locked with a
   fatal service-error display and no retry. PAM_SYSTEM_ERR and PAM_SERVICE_ERR end and discard the handle, display an
   error through the normal failure delay, and permit a fresh transaction afterwards.
