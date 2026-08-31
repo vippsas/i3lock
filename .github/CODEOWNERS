@@ -1,0 +1,5 @@
+# Repository ownership is managed through the Entra-synchronised Linux developers team.
+* @vippsas/team-vipps-linux-developers
+
+# Keep future ownership changes with the Linux developers team.
+/.github/CODEOWNERS @vippsas/team-vipps-linux-developers
