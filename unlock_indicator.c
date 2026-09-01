@@ -808,9 +808,11 @@ static void draw_indicator_on_output(cairo_t *xcb_ctx,
     cairo_destroy(measure_ctx);
     cairo_surface_destroy(measure_surface);
 
+    const double available_width = fmax(1.0, logical_width - (2 * PAM_PANEL_EDGE_MARGIN));
     const double available_height = fmax(1.0,
                                          logical_height - (2 * PAM_PANEL_VERTICAL_EDGE_MARGIN));
-    const double content_scaling_factor = fmin(1.0, available_height / layout.height);
+    const double content_scaling_factor =
+        fmin(1.0, fmin(available_width / layout.width, available_height / layout.height));
     const double render_scaling_factor = scaling_factor * content_scaling_factor;
     const int surface_width = (int)ceil(render_scaling_factor * layout.width);
     const int surface_height = (int)ceil(render_scaling_factor * layout.height);
