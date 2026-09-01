@@ -104,6 +104,15 @@ jobs:
 
     - name: Attach package to release
       if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v2
-      with:
-        files: ${{ steps.pkg.outputs.deb }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        DEB: ${{ steps.pkg.outputs.deb }}
+        TAG: ${{ github.ref_name }}
+      run: |
+        set -eu
+        # Create the release if it does not exist yet (first matrix job wins),
+        # then upload this job's package. --clobber makes re-runs idempotent.
+        if ! gh release view "$TAG" >/dev/null 2>&1; then
+          gh release create "$TAG" --title "$TAG" --generate-notes || true
+        fi
+        gh release upload "$TAG" "$DEB" --clobber
