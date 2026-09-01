@@ -37,7 +37,9 @@
 
 #define MAX_EVENTS 16
 #define SECURE_BUFFER_SIZE 512
-#define PAM_MESSAGE_INPUT_MAX PAM_EVENT_TEXT_MAX
+/* Preserve the former maximum provider-message size without retaining that
+ * much text in the UI event queue. */
+#define PAM_MESSAGE_SOURCE_MAX 4096
 
 /* secure wiping */
 
@@ -197,7 +199,14 @@ static bool pam_message_text_is_valid(const char *text) {
     if (text == NULL) {
         return true;
     }
-    return strnlen(text, PAM_MESSAGE_INPUT_MAX) < PAM_MESSAGE_INPUT_MAX;
+    return strnlen(text, PAM_MESSAGE_SOURCE_MAX) < PAM_MESSAGE_SOURCE_MAX;
+}
+
+static size_t utf8_truncate_to_char_boundary(const char *text, size_t length) {
+    while (length > 0 && ((unsigned char)text[length] & 0xc0) == 0x80) {
+        length--;
+    }
+    return length;
 }
 
 static void event_set_text(pam_event_t *event, const char *text) {
@@ -205,7 +214,20 @@ static void event_set_text(pam_event_t *event, const char *text) {
         event->text[0] = '\0';
         return;
     }
-    snprintf(event->text, sizeof(event->text), "%s", text);
+
+    const size_t source_length = strnlen(text, PAM_MESSAGE_SOURCE_MAX);
+    const size_t maximum_length = sizeof(event->text) - 1;
+    if (source_length <= maximum_length) {
+        memcpy(event->text, text, source_length);
+        event->text[source_length] = '\0';
+        return;
+    }
+
+    const size_t ellipsis_length = strlen("...");
+    const size_t prefix_length =
+        utf8_truncate_to_char_boundary(text, maximum_length - ellipsis_length);
+    memcpy(event->text, text, prefix_length);
+    memcpy(event->text + prefix_length, "...", ellipsis_length + 1);
 }
 
 static int worker_conv_callback(int num_msg,
