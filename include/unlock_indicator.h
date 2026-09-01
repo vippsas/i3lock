@@ -1,10 +1,24 @@
 #ifndef _UNLOCK_INDICATOR_H
 #define _UNLOCK_INDICATOR_H
 
+#include <stdbool.h>
 #include <xcb/xcb.h>
 
-#define I3LOCK_PAM_UI_TEXT_MAX 256
+#include "i3lock.h"
+
 #define I3LOCK_PAM_VISIBLE_INPUT_MAX 256
+
+typedef struct {
+    char status_text[I3LOCK_PAM_DISPLAY_TEXT_MAX];
+    char prompt_text[I3LOCK_PAM_DISPLAY_TEXT_MAX];
+    char visible_input[I3LOCK_PAM_VISIBLE_INPUT_MAX];
+    bool status_is_error;
+    bool prompt_echo_on;
+} pam_display_state_t;
+
+/* The main event loop owns this state. The renderer only observes it while
+ * drawing, keeping PAM presentation details out of renderer globals. */
+const pam_display_state_t* get_pam_display_state(void);
 
 typedef enum {
     STATE_STARTED = 0,           /* default state */

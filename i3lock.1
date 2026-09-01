@@ -49,6 +49,19 @@ is a simple screen locker like slock. After starting it, you will see a white
 screen (you can configure the color/an image). You can return to your screen by
 entering your password.
 
+.SH PAM CONVERSATIONS
+On Linux, i3lock authenticates through the system PAM service named
+.B i3lock.
+It handles informational messages, error messages, hidden prompts, and visible
+prompts in the order supplied by PAM. When the unlock indicator is enabled,
+informational/error messages and visible prompt labels appear in a passive
+panel above it. A first hidden prompt with no status message retains the normal
+circle-only, masked-input behaviour. Visible prompts echo entered text when
+requested by PAM.
+
+Pressing Escape cancels an active PAM conversation and returns to the locked
+input state. Entered credentials are never written to debug output.
+
 .SH IMPROVEMENTS
 
 .IP \[bu] 2
@@ -153,7 +166,7 @@ Show the current keyboard layout.
 .TP
 .B \-\-debug
 Enables debug logging.
-Note, that this will log the password used for authentication to stdout.
+Entered credentials are never logged.
 
 .SH DPMS
 

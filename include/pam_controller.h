@@ -5,7 +5,9 @@
 
 #include <stdint.h>
 
-#define PAM_EVENT_TEXT_MAX 256
+#include "i3lock.h"
+
+#define PAM_EVENT_TEXT_MAX I3LOCK_PAM_DISPLAY_TEXT_MAX
 
 typedef enum {
     PAM_EVENT_AUTH_READY,

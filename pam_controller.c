@@ -37,7 +37,7 @@
 
 #define MAX_EVENTS 16
 #define SECURE_BUFFER_SIZE 512
-#define PAM_MESSAGE_INPUT_MAX 4096
+#define PAM_MESSAGE_INPUT_MAX PAM_EVENT_TEXT_MAX
 
 /* secure wiping */
 
@@ -132,6 +132,7 @@ static void remove_event_at_locked(int index) {
                 (size_t)(ctrl.event_count - index - 1) * sizeof(ctrl.events[0]));
     }
     ctrl.event_count--;
+    secure_wipe(&ctrl.events[ctrl.event_count], sizeof(ctrl.events[0]));
 }
 
 static bool post_event_locked(pam_event_t event) {
@@ -762,16 +763,18 @@ int pam_controller_drain_events(void (*callback)(const pam_event_t *event)) {
 
     pthread_mutex_lock(&ctrl.mutex);
     int count = ctrl.event_count;
-    pam_event_t snapshot[MAX_EVENTS];
+    pam_event_t snapshot[MAX_EVENTS] = {0};
     if (count > 0) {
         memcpy(snapshot, ctrl.events, (size_t)count * sizeof(pam_event_t));
         ctrl.event_count = 0;
+        secure_wipe(ctrl.events, sizeof(ctrl.events));
     }
     pthread_mutex_unlock(&ctrl.mutex);
 
     for (int i = 0; i < count; i++) {
         callback(&snapshot[i]);
     }
+    secure_wipe(snapshot, sizeof(snapshot));
     return count;
 }
 
@@ -797,6 +800,8 @@ void pam_controller_cleanup(void) {
         free(ctrl.secure);
         ctrl.secure = NULL;
     }
+    secure_wipe(ctrl.events, sizeof(ctrl.events));
+    ctrl.event_count = 0;
 
     close(ctrl.pipe_fds[0]);
     close(ctrl.pipe_fds[1]);
