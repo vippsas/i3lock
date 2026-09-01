@@ -37,7 +37,9 @@
 
 #define MAX_EVENTS 16
 #define SECURE_BUFFER_SIZE 512
-#define PAM_MESSAGE_INPUT_MAX 4096
+/* Preserve the former maximum provider-message size without retaining that
+ * much text in the UI event queue. */
+#define PAM_MESSAGE_SOURCE_MAX 4096
 
 /* secure wiping */
 
@@ -132,6 +134,7 @@ static void remove_event_at_locked(int index) {
                 (size_t)(ctrl.event_count - index - 1) * sizeof(ctrl.events[0]));
     }
     ctrl.event_count--;
+    secure_wipe(&ctrl.events[ctrl.event_count], sizeof(ctrl.events[0]));
 }
 
 static bool post_event_locked(pam_event_t event) {
@@ -196,7 +199,14 @@ static bool pam_message_text_is_valid(const char *text) {
     if (text == NULL) {
         return true;
     }
-    return strnlen(text, PAM_MESSAGE_INPUT_MAX) < PAM_MESSAGE_INPUT_MAX;
+    return strnlen(text, PAM_MESSAGE_SOURCE_MAX) < PAM_MESSAGE_SOURCE_MAX;
+}
+
+static size_t utf8_truncate_to_char_boundary(const char *text, size_t length) {
+    while (length > 0 && ((unsigned char)text[length] & 0xc0) == 0x80) {
+        length--;
+    }
+    return length;
 }
 
 static void event_set_text(pam_event_t *event, const char *text) {
@@ -204,7 +214,20 @@ static void event_set_text(pam_event_t *event, const char *text) {
         event->text[0] = '\0';
         return;
     }
-    snprintf(event->text, sizeof(event->text), "%s", text);
+
+    const size_t source_length = strnlen(text, PAM_MESSAGE_SOURCE_MAX);
+    const size_t maximum_length = sizeof(event->text) - 1;
+    if (source_length <= maximum_length) {
+        memcpy(event->text, text, source_length);
+        event->text[source_length] = '\0';
+        return;
+    }
+
+    const size_t ellipsis_length = strlen("...");
+    const size_t prefix_length =
+        utf8_truncate_to_char_boundary(text, maximum_length - ellipsis_length);
+    memcpy(event->text, text, prefix_length);
+    memcpy(event->text + prefix_length, "...", ellipsis_length + 1);
 }
 
 static int worker_conv_callback(int num_msg,
@@ -762,16 +785,18 @@ int pam_controller_drain_events(void (*callback)(const pam_event_t *event)) {
 
     pthread_mutex_lock(&ctrl.mutex);
     int count = ctrl.event_count;
-    pam_event_t snapshot[MAX_EVENTS];
+    pam_event_t snapshot[MAX_EVENTS] = {0};
     if (count > 0) {
         memcpy(snapshot, ctrl.events, (size_t)count * sizeof(pam_event_t));
         ctrl.event_count = 0;
+        secure_wipe(ctrl.events, sizeof(ctrl.events));
     }
     pthread_mutex_unlock(&ctrl.mutex);
 
     for (int i = 0; i < count; i++) {
         callback(&snapshot[i]);
     }
+    secure_wipe(snapshot, sizeof(snapshot));
     return count;
 }
 
@@ -797,6 +822,8 @@ void pam_controller_cleanup(void) {
         free(ctrl.secure);
         ctrl.secure = NULL;
     }
+    secure_wipe(ctrl.events, sizeof(ctrl.events));
+    ctrl.event_count = 0;
 
     close(ctrl.pipe_fds[0]);
     close(ctrl.pipe_fds[1]);

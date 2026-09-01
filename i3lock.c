@@ -81,11 +81,7 @@ static bool beep = false;
 bool debug_mode = false;
 bool unlock_indicator = true;
 char *modifier_string = NULL;
-char pam_status_text[I3LOCK_PAM_UI_TEXT_MAX];
-char pam_prompt_text[I3LOCK_PAM_UI_TEXT_MAX];
-char pam_visible_input[I3LOCK_PAM_VISIBLE_INPUT_MAX];
-bool pam_status_is_error = false;
-bool pam_prompt_echo_on = false;
+static pam_display_state_t pam_display;
 static bool pam_status_expires_with_auth_wrong = false;
 static bool dont_fork = false;
 struct ev_loop *main_loop;
@@ -112,6 +108,10 @@ cairo_surface_t *img = NULL;
 bool tile = false;
 bool ignore_empty_password = false;
 bool skip_repeated_empty_password = false;
+
+const pam_display_state_t *get_pam_display_state(void) {
+    return &pam_display;
+}
 
 /* isutf, u8_dec © 2005 Jeff Bezanson, public domain */
 #define isutf(c) (((c)&0xC0) != 0x80)
@@ -225,13 +225,33 @@ static void clear_password_memory(void) {
 
 static void clear_pam_visible_input(void) {
 #ifdef HAVE_EXPLICIT_BZERO
-    explicit_bzero(pam_visible_input, sizeof(pam_visible_input));
+    explicit_bzero(pam_display.visible_input, sizeof(pam_display.visible_input));
 #else
-    volatile char *vinput = pam_visible_input;
-    for (size_t c = 0; c < sizeof(pam_visible_input); c++) {
+    volatile char *vinput = pam_display.visible_input;
+    for (size_t c = 0; c < sizeof(pam_display.visible_input); c++) {
         vinput[c] = 0;
     }
 #endif
+}
+
+static void clear_pam_display_text_buffer(char *text, size_t text_size) {
+#ifdef HAVE_EXPLICIT_BZERO
+    explicit_bzero(text, text_size);
+#else
+    volatile char *vtext = text;
+    for (size_t c = 0; c < text_size; c++) {
+        vtext[c] = 0;
+    }
+#endif
+}
+
+static void set_pam_display_text(char *destination,
+                                 size_t destination_size,
+                                 const char *text) {
+    clear_pam_display_text_buffer(destination, destination_size);
+    if (text != NULL) {
+        snprintf(destination, destination_size, "%s", text);
+    }
 }
 
 ev_timer *start_timer(ev_timer *timer_obj, ev_tstamp timeout, ev_callback_t callback) {
@@ -341,24 +361,24 @@ static void auth_failed(void) {
 }
 
 static void clear_pam_display_text(void) {
-    pam_status_text[0] = '\0';
-    pam_prompt_text[0] = '\0';
+    clear_pam_display_text_buffer(pam_display.status_text, sizeof(pam_display.status_text));
+    clear_pam_display_text_buffer(pam_display.prompt_text, sizeof(pam_display.prompt_text));
     clear_pam_visible_input();
-    pam_status_is_error = false;
-    pam_prompt_echo_on = false;
+    pam_display.status_is_error = false;
+    pam_display.prompt_echo_on = false;
     pam_status_expires_with_auth_wrong = false;
 }
 
 static void update_pam_visible_input(void) {
     clear_pam_visible_input();
-    if (pam_prompt_echo_on) {
+    if (pam_display.prompt_echo_on) {
         size_t len = strlen(password);
-        if (len >= sizeof(pam_visible_input)) {
-            len = sizeof(pam_visible_input) - 1;
+        if (len >= sizeof(pam_display.visible_input)) {
+            len = sizeof(pam_display.visible_input) - 1;
             len = utf8_truncate_to_char_boundary(password, len);
         }
-        memcpy(pam_visible_input, password, len);
-        pam_visible_input[len] = '\0';
+        memcpy(pam_display.visible_input, password, len);
+        pam_display.visible_input[len] = '\0';
     }
 }
 
@@ -372,8 +392,10 @@ static void handle_pam_event(const pam_event_t *event) {
             if (event->transaction_id != active_pam_transaction_id) {
                 return;
             }
-            snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
-            pam_status_is_error = event->is_error;
+            set_pam_display_text(pam_display.status_text,
+                                 sizeof(pam_display.status_text),
+                                 event->text);
+            pam_display.status_is_error = event->is_error;
             pam_status_expires_with_auth_wrong = false;
             redraw_screen();
             return;
@@ -384,8 +406,10 @@ static void handle_pam_event(const pam_event_t *event) {
             }
             active_pam_prompt_id = event->prompt_id;
             pam_waiting_for_prompt = true;
-            snprintf(pam_prompt_text, sizeof(pam_prompt_text), "%s", event->text);
-            pam_prompt_echo_on = event->echo_on;
+            set_pam_display_text(pam_display.prompt_text,
+                                 sizeof(pam_display.prompt_text),
+                                 event->text);
+            pam_display.prompt_echo_on = event->echo_on;
             clear_pam_visible_input();
             auth_state = STATE_AUTH_IDLE;
             unlock_state = STATE_KEY_PRESSED;
@@ -418,8 +442,10 @@ static void handle_pam_event(const pam_event_t *event) {
             pam_waiting_for_prompt = false;
             if (event->text[0] != '\0') {
                 clear_pam_display_text();
-                snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
-                pam_status_is_error = event->is_error;
+                set_pam_display_text(pam_display.status_text,
+                                     sizeof(pam_display.status_text),
+                                     event->text);
+                pam_display.status_is_error = event->is_error;
                 pam_status_expires_with_auth_wrong = true;
             } else {
                 clear_pam_display_text();
@@ -453,8 +479,10 @@ static void handle_pam_event(const pam_event_t *event) {
             pam_auth_fatal = true;
             if (event->text[0] != '\0') {
                 clear_pam_display_text();
-                snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
-                pam_status_is_error = event->is_error;
+                set_pam_display_text(pam_display.status_text,
+                                     sizeof(pam_display.status_text),
+                                     event->text);
+                pam_display.status_is_error = event->is_error;
                 pam_status_expires_with_auth_wrong = false;
             } else {
                 clear_pam_display_text();
@@ -517,9 +545,9 @@ static void input_done(void) {
         uint64_t prompt_id = active_pam_prompt_id;
         pam_waiting_for_prompt = false;
         active_pam_prompt_id = 0;
-        pam_prompt_text[0] = '\0';
+        clear_pam_display_text_buffer(pam_display.prompt_text, sizeof(pam_display.prompt_text));
         clear_pam_visible_input();
-        pam_prompt_echo_on = false;
+        pam_display.prompt_echo_on = false;
         auth_state = STATE_AUTH_VERIFY;
         if (!pam_controller_submit_answer(transaction_id, prompt_id, password)) {
             auth_state = STATE_AUTH_IDLE;
@@ -1366,7 +1394,7 @@ int main(int argc, char *argv[]) {
     if (mlock(password, sizeof(password)) != 0) {
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
     }
-    if (mlock(pam_visible_input, sizeof(pam_visible_input)) != 0) {
+    if (mlock(pam_display.visible_input, sizeof(pam_display.visible_input)) != 0) {
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
     }
 #endif

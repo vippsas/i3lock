@@ -51,10 +51,13 @@ enter your password and press enter.
 i3lock authenticates through the system PAM service named `i3lock` on Linux.
 It supports standard sequential PAM conversations: informational messages,
 error messages, hidden prompts, and visible prompts are handled in the order
-provided by PAM. Hidden prompts keep the normal masked lock-screen behaviour;
-visible prompts echo the entered text as requested by PAM. Pressing Escape
-cancels the active PAM conversation from i3lock's side and returns to the
-locked input state. i3lock never logs entered credentials.
+provided by PAM. With the unlock indicator enabled, informational/error
+messages and visible prompt labels appear in a passive panel above it. To
+preserve the ordinary password experience, a first hidden prompt with no status
+message keeps the normal circle-only, masked-input behaviour. Visible prompts
+echo the entered text as requested by PAM. Pressing Escape cancels the active
+PAM conversation from i3lock's side and returns to the locked input state.
+i3lock never logs entered credentials, including with `--debug`.
 
 For a more permanent setup, we strongly recommend using `xss-lock` so that the
 screen is locked *before* your laptop suspends:
