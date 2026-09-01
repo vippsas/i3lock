@@ -118,6 +118,7 @@ i3lock_deps = [
 host_os = host_machine.system()
 if host_os != 'openbsd'
   pam_dep = cc.find_library('pam', required: true)
+  i3lock_srcs += ['pam_controller.c']
   i3lock_deps += [pam_dep]
 endif
 

@@ -41,6 +41,9 @@
 #include <xcb/randr.h>
 
 #include "i3lock.h"
+#ifndef __OpenBSD__
+#include "pam_controller.h"
+#endif
 #include "xcb.h"
 #include "cursors.h"
 #include "unlock_indicator.h"
@@ -56,14 +59,20 @@
 
 typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
 static void input_done(void);
+static void clear_pam_display_text(void);
 
 char color[7] = "a3a3a3";
 uint32_t last_resolution[2];
 xcb_window_t win;
 static xcb_cursor_t cursor;
 #ifndef __OpenBSD__
-static pam_handle_t *pam_handle;
-static bool pam_cleanup;
+static bool controller_started = false;
+static uint64_t active_pam_transaction_id = 0;
+static uint64_t active_pam_prompt_id = 0;
+static bool pam_waiting_for_prompt = false;
+static bool pam_auth_fatal = false;
+static struct ev_io *pam_watcher = NULL;
+static char *saved_username = NULL;
 #endif
 int input_position = 0;
 /* Holds the password you enter (in UTF-8). */
@@ -72,6 +81,12 @@ static bool beep = false;
 bool debug_mode = false;
 bool unlock_indicator = true;
 char *modifier_string = NULL;
+char pam_status_text[I3LOCK_PAM_UI_TEXT_MAX];
+char pam_prompt_text[I3LOCK_PAM_UI_TEXT_MAX];
+char pam_visible_input[I3LOCK_PAM_VISIBLE_INPUT_MAX];
+bool pam_status_is_error = false;
+bool pam_prompt_echo_on = false;
+static bool pam_status_expires_with_auth_wrong = false;
 static bool dont_fork = false;
 struct ev_loop *main_loop;
 static struct ev_timer *clear_auth_wrong_timeout;
@@ -107,6 +122,17 @@ bool skip_repeated_empty_password = false;
  */
 static void u8_dec(char *s, int *i) {
     (void)(isutf(s[--(*i)]) || isutf(s[--(*i)]) || isutf(s[--(*i)]) || --(*i));
+}
+
+static bool is_utf8_continuation_byte(unsigned char byte) {
+    return (byte & 0xC0) == 0x80;
+}
+
+static size_t utf8_truncate_to_char_boundary(const char *s, size_t len) {
+    while (len > 0 && is_utf8_continuation_byte((unsigned char)s[len])) {
+        len--;
+    }
+    return len;
 }
 
 /*
@@ -197,6 +223,17 @@ static void clear_password_memory(void) {
 #endif
 }
 
+static void clear_pam_visible_input(void) {
+#ifdef HAVE_EXPLICIT_BZERO
+    explicit_bzero(pam_visible_input, sizeof(pam_visible_input));
+#else
+    volatile char *vinput = pam_visible_input;
+    for (size_t c = 0; c < sizeof(pam_visible_input); c++) {
+        vinput[c] = 0;
+    }
+#endif
+}
+
 ev_timer *start_timer(ev_timer *timer_obj, ev_tstamp timeout, ev_callback_t callback) {
     if (timer_obj) {
         ev_timer_stop(main_loop, timer_obj);
@@ -241,6 +278,9 @@ static void finish_input(void) {
 static void clear_auth_wrong(EV_P_ ev_timer *w, int revents) {
     DEBUG("clearing auth wrong\n");
     auth_state = STATE_AUTH_IDLE;
+    if (pam_status_expires_with_auth_wrong) {
+        clear_pam_display_text();
+    }
     redraw_screen();
 
     /* Clear modifier string. */
@@ -268,6 +308,7 @@ static void clear_input(void) {
     input_position = 0;
     clear_password_memory();
     password[input_position] = '\0';
+    clear_pam_visible_input();
 }
 
 static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
@@ -275,8 +316,181 @@ static void discard_passwd_cb(EV_P_ ev_timer *w, int revents) {
     STOP_TIMER(discard_passwd_timeout);
 }
 
+static void auth_failed(void) {
+    if (debug_mode) {
+        fprintf(stderr, "Authentication failure\n");
+    }
+
+    auth_state = STATE_AUTH_WRONG;
+    if (failed_attempts < 999) {
+        failed_attempts += 1;
+    }
+    clear_input();
+    if (unlock_indicator) {
+        redraw_screen();
+    }
+
+    ev_now_update(main_loop);
+    START_TIMER(clear_auth_wrong_timeout, TSTAMP_N_SECS(2), clear_auth_wrong);
+    STOP_TIMER(clear_indicator_timeout);
+
+    if (beep) {
+        xcb_bell(conn, 100);
+        xcb_flush(conn);
+    }
+}
+
+static void clear_pam_display_text(void) {
+    pam_status_text[0] = '\0';
+    pam_prompt_text[0] = '\0';
+    clear_pam_visible_input();
+    pam_status_is_error = false;
+    pam_prompt_echo_on = false;
+    pam_status_expires_with_auth_wrong = false;
+}
+
+static void update_pam_visible_input(void) {
+    clear_pam_visible_input();
+    if (pam_prompt_echo_on) {
+        size_t len = strlen(password);
+        if (len >= sizeof(pam_visible_input)) {
+            len = sizeof(pam_visible_input) - 1;
+            len = utf8_truncate_to_char_boundary(password, len);
+        }
+        memcpy(pam_visible_input, password, len);
+        pam_visible_input[len] = '\0';
+    }
+}
+
+#ifndef __OpenBSD__
+static void handle_pam_event(const pam_event_t *event) {
+    switch (event->type) {
+        case PAM_EVENT_AUTH_READY:
+            return;
+
+        case PAM_EVENT_AUTH_STATUS:
+            if (event->transaction_id != active_pam_transaction_id) {
+                return;
+            }
+            snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
+            pam_status_is_error = event->is_error;
+            pam_status_expires_with_auth_wrong = false;
+            redraw_screen();
+            return;
+
+        case PAM_EVENT_AUTH_PROMPT:
+            if (event->transaction_id != active_pam_transaction_id) {
+                return;
+            }
+            active_pam_prompt_id = event->prompt_id;
+            pam_waiting_for_prompt = true;
+            snprintf(pam_prompt_text, sizeof(pam_prompt_text), "%s", event->text);
+            pam_prompt_echo_on = event->echo_on;
+            clear_pam_visible_input();
+            auth_state = STATE_AUTH_IDLE;
+            unlock_state = STATE_KEY_PRESSED;
+            clear_input();
+            redraw_screen();
+            return;
+
+        case PAM_EVENT_AUTH_SUCCESS:
+            if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
+                return;
+            }
+            DEBUG("successfully authenticated\n");
+            active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            clear_pam_display_text();
+            clear_password_memory();
+            pam_controller_ack_terminal(event->transaction_id);
+            ev_break(EV_DEFAULT, EVBREAK_ALL);
+            return;
+
+        case PAM_EVENT_AUTH_FAILURE:
+            if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
+                return;
+            }
+            active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            if (event->text[0] != '\0') {
+                clear_pam_display_text();
+                snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
+                pam_status_is_error = event->is_error;
+                pam_status_expires_with_auth_wrong = true;
+            } else {
+                clear_pam_display_text();
+            }
+            auth_failed();
+            pam_controller_ack_terminal(event->transaction_id);
+            return;
+
+        case PAM_EVENT_AUTH_CANCELLED:
+            if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
+                return;
+            }
+            active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            clear_pam_display_text();
+            auth_state = STATE_AUTH_IDLE;
+            redraw_screen();
+            pam_controller_ack_terminal(event->transaction_id);
+            return;
+
+        case PAM_EVENT_AUTH_FATAL:
+            if (event->transaction_id != active_pam_transaction_id) {
+                pam_controller_ack_terminal(event->transaction_id);
+                return;
+            }
+            active_pam_transaction_id = 0;
+            active_pam_prompt_id = 0;
+            pam_waiting_for_prompt = false;
+            pam_auth_fatal = true;
+            if (event->text[0] != '\0') {
+                clear_pam_display_text();
+                snprintf(pam_status_text, sizeof(pam_status_text), "%s", event->text);
+                pam_status_is_error = event->is_error;
+                pam_status_expires_with_auth_wrong = false;
+            } else {
+                clear_pam_display_text();
+            }
+            auth_state = STATE_I3LOCK_LOCK_FAILED;
+            clear_input();
+            redraw_screen();
+            pam_controller_ack_terminal(event->transaction_id);
+            return;
+    }
+}
+
+static void pam_event_cb(EV_P_ ev_io *w, int revents) {
+    (void)w;
+    (void)revents;
+    pam_controller_drain_events(handle_pam_event);
+}
+#endif
+
 static void input_done(void) {
     STOP_TIMER(clear_auth_wrong_timeout);
+
+#ifndef __OpenBSD__
+    if (pam_auth_fatal) {
+        auth_state = STATE_I3LOCK_LOCK_FAILED;
+        clear_input();
+        redraw_screen();
+        return;
+    }
+#endif
+
+    /* Do not start a second authentication while one is in progress. */
+    if (auth_state == STATE_AUTH_VERIFY) {
+        return;
+    }
+
     auth_state = STATE_AUTH_VERIFY;
     unlock_state = STATE_STARTED;
     redraw_screen();
@@ -295,52 +509,42 @@ static void input_done(void) {
         ev_break(EV_DEFAULT, EVBREAK_ALL);
         return;
     }
+
+    auth_failed();
 #else
-    if (pam_authenticate(pam_handle, 0) == PAM_SUCCESS) {
-        DEBUG("successfully authenticated\n");
+    if (pam_waiting_for_prompt) {
+        uint64_t transaction_id = active_pam_transaction_id;
+        uint64_t prompt_id = active_pam_prompt_id;
+        pam_waiting_for_prompt = false;
+        active_pam_prompt_id = 0;
+        pam_prompt_text[0] = '\0';
+        clear_pam_visible_input();
+        pam_prompt_echo_on = false;
+        auth_state = STATE_AUTH_VERIFY;
+        if (!pam_controller_submit_answer(transaction_id, prompt_id, password)) {
+            auth_state = STATE_AUTH_IDLE;
+        }
         clear_password_memory();
-
-        /* PAM credentials should be refreshed, this will for example update any kerberos tickets.
-         * Related to credentials pam_end() needs to be called to cleanup any temporary
-         * credentials like kerberos /tmp/krb5cc_pam_* files which may of been left behind if the
-         * refresh of the credentials failed. */
-        pam_setcred(pam_handle, PAM_REFRESH_CRED);
-        pam_cleanup = true;
-
-        ev_break(EV_DEFAULT, EVBREAK_ALL);
+        redraw_screen();
         return;
     }
-#endif
 
-    if (debug_mode) {
-        fprintf(stderr, "Authentication failure\n");
-    }
-
-    auth_state = STATE_AUTH_WRONG;
-    /* The unlock indicator displays the number of failed attempts,
-     * but caps the attempts to 999, so only increment up to 999. */
-    if (failed_attempts < 999) {
-        failed_attempts += 1;
-    }
-    clear_input();
-    if (unlock_indicator) {
+    if (!controller_started) {
+        auth_state = STATE_I3LOCK_LOCK_FAILED;
         redraw_screen();
+        return;
     }
 
-    /* Clear this state after 2 seconds (unless the user enters another
-     * password during that time). */
-    ev_now_update(main_loop);
-    START_TIMER(clear_auth_wrong_timeout, TSTAMP_N_SECS(2), clear_auth_wrong);
-
-    /* Cancel the clear_indicator_timeout, it would hide the unlock indicator
-     * too early. */
-    STOP_TIMER(clear_indicator_timeout);
-
-    /* beep on authentication failure, if enabled */
-    if (beep) {
-        xcb_bell(conn, 100);
-        xcb_flush(conn);
+    active_pam_transaction_id = pam_controller_start_auth(password);
+    if (active_pam_transaction_id == 0) {
+        auth_state = STATE_AUTH_IDLE;
+        clear_password_memory();
+        redraw_screen();
+        return;
     }
+    clear_pam_display_text();
+    clear_password_memory();
+#endif
 }
 
 static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
@@ -440,6 +644,16 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             if ((ksym == XKB_KEY_u && ctrl) ||
                 ksym == XKB_KEY_Escape) {
                 DEBUG("C-u pressed\n");
+#ifndef __OpenBSD__
+                if (ksym == XKB_KEY_Escape && active_pam_transaction_id != 0) {
+                    pam_controller_cancel_auth(active_pam_transaction_id);
+                    active_pam_transaction_id = 0;
+                    active_pam_prompt_id = 0;
+                    pam_waiting_for_prompt = false;
+                    clear_pam_display_text();
+                    auth_state = STATE_AUTH_IDLE;
+                }
+#endif
                 clear_input();
                 /* Also hide the unlock indicator */
                 if (unlock_indicator) {
@@ -473,6 +687,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             /* decrement input_position to point to the previous glyph */
             u8_dec(password, &input_position);
             password[input_position] = '\0';
+            update_pam_visible_input();
 
             /* Hide the unlock indicator after a bit if the password buffer is
              * empty. */
@@ -505,7 +720,9 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     /* store it in the password array as UTF-8 */
     memcpy(password + input_position, buffer, n - 1);
     input_position += n - 1;
-    DEBUG("current password = %.*s\n", input_position, password);
+    password[input_position] = '\0';
+    update_pam_visible_input();
+    DEBUG("key accepted, input_position = %d\n", input_position);
 
     if (unlock_indicator) {
         unlock_state = STATE_KEY_ACTIVE;
@@ -808,41 +1025,6 @@ static bool verify_png_image(const char *image_path) {
     return true;
 }
 
-#ifndef __OpenBSD__
-/*
- * Callback function for PAM. We only react on password request callbacks.
- *
- */
-static int conv_callback(int num_msg, const struct pam_message **msg,
-                         struct pam_response **resp, void *appdata_ptr) {
-    if (num_msg == 0) {
-        return 1;
-    }
-
-    /* PAM expects an array of responses, one for each message */
-    if ((*resp = calloc(num_msg, sizeof(struct pam_response))) == NULL) {
-        perror("calloc");
-        return 1;
-    }
-
-    for (int c = 0; c < num_msg; c++) {
-        if (msg[c]->msg_style != PAM_PROMPT_ECHO_OFF &&
-            msg[c]->msg_style != PAM_PROMPT_ECHO_ON) {
-            continue;
-        }
-
-        /* return code is currently not used but should be set to zero */
-        resp[c]->resp_retcode = 0;
-        if ((resp[c]->resp = strdup(password)) == NULL) {
-            perror("strdup");
-            return 1;
-        }
-    }
-
-    return 0;
-}
-#endif
-
 /*
  * This callback is only a dummy, see xcb_prepare_cb and xcb_check_cb.
  * See also man libev(3): "ev_prepare" and "ev_check" - customise your event loop
@@ -866,6 +1048,12 @@ static void xcb_prepare_cb(EV_P_ ev_prepare *w, int revents) {
  *
  */
 static void maybe_close_sleep_lock_fd(void) {
+    static bool sleep_lock_fd_closed = false;
+    if (sleep_lock_fd_closed) {
+        return;
+    }
+    sleep_lock_fd_closed = true;
+
     const char *sleep_lock_fd = getenv("XSS_SLEEP_LOCK_FD");
     char *endptr;
     if (sleep_lock_fd && *sleep_lock_fd != 0) {
@@ -873,6 +1061,15 @@ static void maybe_close_sleep_lock_fd(void) {
         if (*endptr == 0) {
             close(fd);
         }
+        unsetenv("XSS_SLEEP_LOCK_FD");
+    }
+}
+
+static void stay_locked_after_lock_failure(void) {
+    auth_state = STATE_I3LOCK_LOCK_FAILED;
+    redraw_screen();
+    while (true) {
+        pause();
     }
 }
 
@@ -899,6 +1096,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
             continue;
         }
 
+        bool synthetic_event = (event->response_type & 0x80) != 0;
         /* Strip off the highest bit (set if the event is generated) */
         int type = (event->response_type & 0x7F);
 
@@ -912,19 +1110,47 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 break;
 
             case XCB_MAP_NOTIFY:
+                if (synthetic_event) {
+                    break;
+                }
                 maybe_close_sleep_lock_fd();
                 if (!dont_fork) {
                     /* After the first MapNotify, we never fork again. We don’t
                      * expect to get another MapNotify, but better be sure… */
                     dont_fork = true;
 
-                    /* In the parent process, we exit */
-                    if (fork() != 0) {
+                    pid_t fork_result = fork();
+                    if (fork_result == -1) {
+                        fprintf(stderr, "[i3lock] could not daemonize after locking; continuing in foreground\n");
+                    } else if (fork_result != 0) {
+                        /* In the parent process, we exit */
                         exit(0);
+                    } else {
+                        ev_loop_fork(EV_DEFAULT);
                     }
-
-                    ev_loop_fork(EV_DEFAULT);
                 }
+#ifndef __OpenBSD__
+                if (!controller_started) {
+                    pam_watcher = calloc(1, sizeof(struct ev_io));
+                    if (pam_watcher == NULL) {
+                        fprintf(stderr, "[i3lock] could not allocate PAM event watcher\n");
+                        auth_state = STATE_I3LOCK_LOCK_FAILED;
+                        redraw_screen();
+                        break;
+                    }
+                    if (!pam_controller_init(saved_username, getenv("DISPLAY"))) {
+                        free(pam_watcher);
+                        pam_watcher = NULL;
+                        auth_state = STATE_I3LOCK_LOCK_FAILED;
+                        redraw_screen();
+                        break;
+                    }
+                    ev_io_init(pam_watcher, pam_event_cb,
+                               pam_controller_get_fd(), EV_READ);
+                    ev_io_start(main_loop, pam_watcher);
+                    controller_started = true;
+                }
+#endif
                 break;
 
             case XCB_CONFIGURE_NOTIFY:
@@ -1010,10 +1236,6 @@ int main(int argc, char *argv[]) {
     char *username;
     char *image_path = NULL;
     char *image_raw_format = NULL;
-#ifndef __OpenBSD__
-    int ret;
-    struct pam_conv conv = {conv_callback, NULL};
-#endif
     int curs_choice = CURS_NONE;
     int o;
     int longoptind = 0;
@@ -1118,6 +1340,9 @@ int main(int argc, char *argv[]) {
     if ((username = pw->pw_name) == NULL) {
         errx(EXIT_FAILURE, "pw->pw_name is NULL.");
     }
+#ifndef __OpenBSD__
+    saved_username = username;
+#endif
     if (getenv("WAYLAND_DISPLAY") != NULL) {
         errx(EXIT_FAILURE, "i3lock is a program for X11 and does not work on Wayland. Try https://github.com/swaywm/swaylock instead");
     }
@@ -1126,16 +1351,8 @@ int main(int argc, char *argv[]) {
      * the unlock indicator upon keypresses. */
     srand(time(NULL));
 
-#ifndef __OpenBSD__
-    /* Initialize PAM */
-    if ((ret = pam_start("i3lock", username, &conv, &pam_handle)) != PAM_SUCCESS) {
-        errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
-    }
-
-    if ((ret = pam_set_item(pam_handle, PAM_TTY, getenv("DISPLAY"))) != PAM_SUCCESS) {
-        errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
-    }
-#endif
+    /* PAM initialisation has moved to pam_controller_init(), called from
+     * the first XCB_MAP_NOTIFY handler after the daemonisation fork. */
 
 /* Using mlock() as non-super-user seems only possible in Linux.
  * Users of other operating systems should use encrypted swap/no swap
@@ -1147,6 +1364,9 @@ int main(int argc, char *argv[]) {
      * be swapped to disk. Since Linux 2.6.9, this does not require any
      * privileges, just enough bytes in the RLIMIT_MEMLOCK limit. */
     if (mlock(password, sizeof(password)) != 0) {
+        err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
+    }
+    if (mlock(pam_visible_input, sizeof(pam_visible_input)) != 0) {
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
     }
 #endif
@@ -1308,6 +1528,12 @@ int main(int argc, char *argv[]) {
     struct ev_io *xcb_watcher = calloc(1, sizeof(struct ev_io));
     struct ev_check *xcb_check = calloc(1, sizeof(struct ev_check));
     struct ev_prepare *xcb_prepare = calloc(1, sizeof(struct ev_prepare));
+    if (xcb_watcher == NULL || xcb_check == NULL || xcb_prepare == NULL) {
+        free(xcb_watcher);
+        free(xcb_check);
+        free(xcb_prepare);
+        stay_locked_after_lock_failure();
+    }
 
     ev_io_init(xcb_watcher, xcb_got_event, xcb_get_file_descriptor(conn), EV_READ);
     ev_io_start(main_loop, xcb_watcher);
@@ -1325,9 +1551,8 @@ int main(int argc, char *argv[]) {
     ev_loop(main_loop, 0);
 
 #ifndef __OpenBSD__
-    if (pam_cleanup) {
-        pam_end(pam_handle, PAM_SUCCESS);
-    }
+    pam_controller_cleanup();
+    free(pam_watcher);
 #endif
 
     if (stolen_focus == XCB_NONE) {

@@ -27,6 +27,8 @@
 #define BUTTON_SPACE (BUTTON_RADIUS + 5)
 #define BUTTON_CENTER (BUTTON_RADIUS + 5)
 #define BUTTON_DIAMETER (2 * BUTTON_SPACE)
+#define PAM_TEXT_MAX_WIDTH (BUTTON_DIAMETER - 20)
+#define PAM_TEXT_ELLIPSIS "..."
 
 /*******************************************************************************
  * Variables defined in i3lock.c.
@@ -49,6 +51,11 @@ extern bool unlock_indicator;
 
 /* List of pressed modifiers, or NULL if none are pressed. */
 extern char *modifier_string;
+extern char pam_status_text[I3LOCK_PAM_UI_TEXT_MAX];
+extern char pam_prompt_text[I3LOCK_PAM_UI_TEXT_MAX];
+extern char pam_visible_input[I3LOCK_PAM_VISIBLE_INPUT_MAX];
+extern bool pam_status_is_error;
+extern bool pam_prompt_echo_on;
 /* Name of the current keyboard layout or NULL if not initialized. */
 char *layout_string = NULL;
 
@@ -118,6 +125,77 @@ static void display_button_text(
     }
     cairo_show_text(ctx, text);
     cairo_close_path(ctx);
+}
+
+static void display_centered_text(cairo_t *ctx, const char *text, double y_offset) {
+    cairo_text_extents_t extents;
+    double x, y;
+
+    cairo_text_extents(ctx, text, &extents);
+    x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
+    y = BUTTON_CENTER - ((extents.height / 2) + extents.y_bearing) + y_offset;
+
+    cairo_move_to(ctx, x, y);
+    cairo_show_text(ctx, text);
+    cairo_close_path(ctx);
+}
+
+static bool is_utf8_continuation_byte(unsigned char byte) {
+    return (byte & 0xC0) == 0x80;
+}
+
+static size_t utf8_truncate_to_char_boundary(const char *s, size_t len) {
+    while (len > 0 && is_utf8_continuation_byte((unsigned char)s[len])) {
+        len--;
+    }
+    return len;
+}
+
+static void truncate_text_to_width(cairo_t *ctx, const char *text, double max_width, char *output, size_t output_size) {
+    cairo_text_extents_t extents;
+    const size_t ellipsis_len = strlen(PAM_TEXT_ELLIPSIS);
+    size_t len;
+
+    if (output_size == 0) {
+        return;
+    }
+
+    snprintf(output, output_size, "%s", text);
+    cairo_text_extents(ctx, output, &extents);
+    if (extents.width <= max_width) {
+        return;
+    }
+
+    if (output_size <= ellipsis_len + 1) {
+        output[0] = '\0';
+        return;
+    }
+
+    len = strlen(text);
+    if (len > output_size - ellipsis_len - 1) {
+        len = output_size - ellipsis_len - 1;
+    }
+
+    while (len > 0) {
+        len = utf8_truncate_to_char_boundary(text, len);
+        memcpy(output, text, len);
+        output[len] = '\0';
+        strncat(output, PAM_TEXT_ELLIPSIS, output_size - strlen(output) - 1);
+        cairo_text_extents(ctx, output, &extents);
+        if (extents.width <= max_width) {
+            return;
+        }
+        len--;
+    }
+
+    snprintf(output, output_size, "%s", PAM_TEXT_ELLIPSIS);
+}
+
+static void display_centered_text_bounded(cairo_t *ctx, const char *text, double y_offset, double max_width) {
+    char bounded_text[I3LOCK_PAM_UI_TEXT_MAX + sizeof(PAM_TEXT_ELLIPSIS)];
+
+    truncate_text_to_width(ctx, text, max_width, bounded_text, sizeof(bounded_text));
+    display_centered_text(ctx, bounded_text, y_offset);
 }
 
 static void update_layout_string() {
@@ -292,6 +370,7 @@ void draw_image(xcb_pixmap_t bg_pixmap, uint32_t *resolution) {
 
         /* Display a (centered) text of the current PAM state. */
         char *text = NULL;
+        bool prompt_text_is_main = false;
         /* We don't want to show more than a 3-digit number. */
         char buf[4];
 
@@ -325,6 +404,14 @@ void draw_image(xcb_pixmap_t bg_pixmap, uint32_t *resolution) {
                     cairo_set_source_rgb(ctx, 1, 0, 0);
                     cairo_set_font_size(ctx, 32.0);
                 }
+                if (pam_prompt_echo_on && pam_visible_input[0] != '\0') {
+                    text = pam_visible_input;
+                    cairo_set_font_size(ctx, 16.0);
+                } else if (pam_prompt_text[0] != '\0' && !pam_prompt_echo_on) {
+                    text = pam_prompt_text;
+                    prompt_text_is_main = true;
+                    cairo_set_font_size(ctx, 16.0);
+                }
                 break;
         }
 
@@ -332,11 +419,33 @@ void draw_image(xcb_pixmap_t bg_pixmap, uint32_t *resolution) {
             display_button_text(ctx, text, 0., use_dark_text);
         }
 
-        if (modifier_string != NULL) {
+        if (pam_prompt_text[0] != '\0' && !prompt_text_is_main) {
+            cairo_set_font_size(ctx, 12.0);
+            if (use_dark_text) {
+                cairo_set_source_rgb(ctx, 0., 0., 0.);
+            } else {
+                cairo_set_source_rgb(ctx, 1., 1., 1.);
+            }
+            display_centered_text_bounded(ctx, pam_prompt_text, -28., PAM_TEXT_MAX_WIDTH);
+        }
+
+        if (pam_status_text[0] != '\0') {
+            cairo_set_font_size(ctx, 12.0);
+            if (pam_status_is_error) {
+                cairo_set_source_rgb(ctx, 1., 0., 0.);
+            } else if (use_dark_text) {
+                cairo_set_source_rgb(ctx, 0., 0., 0.);
+            } else {
+                cairo_set_source_rgb(ctx, 1., 1., 1.);
+            }
+            display_centered_text_bounded(ctx, pam_status_text, 28., PAM_TEXT_MAX_WIDTH);
+        }
+
+        if (modifier_string != NULL && pam_status_text[0] == '\0') {
             cairo_set_font_size(ctx, 14.0);
             display_button_text(ctx, modifier_string, 28., use_dark_text);
         }
-        if (show_keyboard_layout && layout_string != NULL) {
+        if (show_keyboard_layout && layout_string != NULL && pam_prompt_text[0] == '\0') {
             cairo_set_font_size(ctx, 14.0);
             display_button_text(ctx, layout_string, -28., use_dark_text);
         }
