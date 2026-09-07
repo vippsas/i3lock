@@ -1,0 +1,49 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze C/C++
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkg-config \
+            libpam0g-dev libcairo2-dev libxcb1-dev libxcb-dpms0-dev \
+            libxcb-image0-dev libxcb-util0-dev libxcb-randr0-dev \
+            libxcb-xinerama0-dev libxcb-xkb-dev libxcb-xrm-dev \
+            libev-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - name: Configure and build
+        run: |
+          meson setup build --buildtype=release
+          ninja -C build
+
+      - name: Analyze C/C++
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: '/language:c-cpp'
